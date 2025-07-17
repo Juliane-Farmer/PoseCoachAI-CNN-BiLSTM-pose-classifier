@@ -1,6 +1,6 @@
 
 venv/
-PoseCoachAI/
+PoseCoachvenv/
 __pycache__/
 *.py[cod]
 .DS_Store
