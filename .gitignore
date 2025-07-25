@@ -4,3 +4,4 @@ PoseCoachvenv/
 __pycache__/
 *.py[cod]
 .DS_Store
+dataset/exercise_detection/*.csv
