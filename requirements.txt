@@ -67,3 +67,4 @@ urllib3==2.5.0
 uvicorn==0.35.0
 watchdog==6.0.0
 streamlit-webrtc 
+seaborn==0.13.2
