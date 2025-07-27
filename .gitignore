@@ -5,3 +5,6 @@ __pycache__/
 *.py[cod]
 .DS_Store
 dataset/exercise_detection/*.csv
+dataset/videos/*.mp4 
+dataset/*.csv
+model/*.txt
