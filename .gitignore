@@ -7,4 +7,12 @@ __pycache__/
 dataset/exercise_detection/*.csv
 dataset/videos/*.mp4 
 dataset/*.csv
+dataset/*.npz
+dataset/windows_*.npz
+
 model/*.txt
+model/**/*.pt
+model/**/scaler*.pkl
+
+artifacts/**
+
