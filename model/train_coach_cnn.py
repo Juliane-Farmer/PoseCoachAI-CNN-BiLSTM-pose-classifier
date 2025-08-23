@@ -9,6 +9,7 @@ from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
 from sklearn.model_selection import GroupShuffleSplit, StratifiedShuffleSplit
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 
+
 class CNNBiLSTM(nn.Module):
     def __init__(self, in_feats, cnn_channels=256, lstm_hidden=256,
                  lstm_layers=2, dropout=0.5, num_type=5, num_form=None):
@@ -26,15 +27,16 @@ class CNNBiLSTM(nn.Module):
         self.head_form = nn.Linear(lstm_hidden * 2, num_form) if (num_form and num_form > 1) else None
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)                            
+        x = x.permute(0, 2, 1)                             
         x = self.dropout(torch.relu(self.bn1(self.conv1(x))))
         x = self.dropout(torch.relu(self.bn2(self.conv2(x))))
-        x = x.permute(0, 2, 1)                            
+        x = x.permute(0, 2, 1)                           
         _, (hn, _) = self.lstm(x)                          
-        h = torch.cat([hn[-2], hn[-1]], dim=1)          
+        h = torch.cat([hn[-2], hn[-1]], dim=1)             
         logits_type = self.head_type(self.dropout(h))
         logits_form = self.head_form(self.dropout(h)) if self.head_form is not None else None
         return logits_type, logits_form
+
 
 def seed_everything(seed: int):
     random.seed(seed)
@@ -44,12 +46,13 @@ def seed_everything(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 def load_npz(npz_path):
     data = np.load(npz_path, allow_pickle=True)
     return data["X"], data["y_type"], data["y_form"], list(data["feat_cols"])
 
+
 def augment_batch(x, time_shift=10, time_mask_prob=0.2, time_mask_len=12, feat_noise_std=0.02):
-    """Temporal augs on (B,T,F) numpy array."""
     B, T, F = x.shape
     out = x.copy()
     if time_shift > 0:
@@ -72,10 +75,11 @@ def class_weights_from_labels(labels, num_classes):
     weights = len(labels) / (num_classes * counts)
     return torch.tensor(weights, dtype=torch.float32)
 
+
 class FocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=2.0):
         super().__init__()
-        self.alpha = alpha 
+        self.alpha = alpha
         self.gamma = gamma
 
     def forward(self, logits, target):
@@ -89,14 +93,15 @@ class FocalLoss(nn.Module):
             loss = loss * at
         return loss.mean()
 
-def make_grouped_split_all_classes(X, y, groups, seed, max_tries=200):
-    """Try many grouped splits and return one that has all classes in val if possible."""
+
+def make_grouped_split_all_classes(X, y, groups, seed, val_ratio=0.35, max_tries=200):
     rng = np.random.RandomState(seed)
     n_classes = len(np.unique(y))
     best = None
     best_unique = -1
+    train_size = max(0.0, min(1.0, 1.0 - float(val_ratio)))
     for _ in range(max_tries):
-        gss = GroupShuffleSplit(n_splits=1, train_size=0.8, random_state=rng.randint(0, 10_000))
+        gss = GroupShuffleSplit(n_splits=1, train_size=train_size, random_state=rng.randint(0, 10_000))
         train_idx, val_idx = next(gss.split(X, y, groups))
         u = len(np.unique(y[val_idx]))
         if u == n_classes:
@@ -106,6 +111,21 @@ def make_grouped_split_all_classes(X, y, groups, seed, max_tries=200):
             best = (train_idx, val_idx)
     print(f"[warn] Could not include all {n_classes} classes in val; using split with {best_unique}.")
     return best[0], best[1], False
+
+def make_grouped_stratified_by_video(y_type, videos, val_ratio=0.35, seed=42):
+    vids, inv = np.unique(videos, return_inverse=True) 
+    vid_labels = np.zeros(len(vids), dtype=int)
+    for i in range(len(vids)):
+        cls_counts = np.bincount(y_type[inv == i])
+        vid_labels[i] = cls_counts.argmax()
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=val_ratio, random_state=seed)
+    (train_vid_idx, val_vid_idx), = sss.split(vids, vid_labels)
+    train_mask = np.isin(inv, train_vid_idx)
+    val_mask   = np.isin(inv, val_vid_idx)
+    train_idx = np.where(train_mask)[0]
+    val_idx   = np.where(val_mask)[0]
+    return train_idx, val_idx
+
 
 def make_stratified_split(X, y, seed):
     sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
@@ -126,7 +146,17 @@ def train(args):
     use_form = len(unique_form) > 1
 
     if args.grouped_split:
-        train_idx, val_idx, ok = make_grouped_split_all_classes(X, y_type, groups, seed=args.seed)
+        n_vids = len(np.unique(groups))
+        n_cls  = len(np.unique(y_type))
+        val_vids = int(round(n_vids * args.val_ratio))
+        if val_vids < n_cls:
+            print(f"[warn] val videos ({val_vids}) < num classes ({n_cls}); increase --val_ratio or add videos.")
+        if args.grouped_strategy == "stratified":
+            train_idx, val_idx = make_grouped_stratified_by_video(y_type, groups, args.val_ratio, args.seed)
+            ok = len(np.unique(y_type[val_idx])) == n_cls
+        else:
+            train_idx, val_idx, ok = make_grouped_split_all_classes(
+                X, y_type, groups, seed=args.seed, val_ratio=args.val_ratio)
     else:
         train_idx, val_idx = make_stratified_split(X, y_type, seed=args.seed)
         ok = len(np.unique(y_type[val_idx])) == len(np.unique(y_type))
@@ -170,21 +200,22 @@ def train(args):
         num_type=n_type_classes,
         num_form=(int(y_form.max()+1) if use_form else None)).to(device)
 
+    smoothing = 0.0 if args.focal_loss else args.label_smoothing
     if args.focal_loss:
         alpha = type_weights.to(device) if args.class_balance else None
         type_criterion = FocalLoss(alpha=alpha, gamma=args.gamma)
     else:
         if args.class_balance:
-            type_criterion = nn.CrossEntropyLoss(weight=type_weights.to(device), label_smoothing=args.label_smoothing)
+            type_criterion = nn.CrossEntropyLoss(weight=type_weights.to(device), label_smoothing=smoothing)
         else:
-            type_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+            type_criterion = nn.CrossEntropyLoss(label_smoothing=smoothing)
 
     ce_form = None
     if use_form and model.head_form is not None:
         if args.class_balance and form_weights is not None:
-            ce_form = nn.CrossEntropyLoss(weight=form_weights.to(device), label_smoothing=args.label_smoothing)
+            ce_form = nn.CrossEntropyLoss(weight=form_weights.to(device), label_smoothing=smoothing)
         else:
-            ce_form = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+            ce_form = nn.CrossEntropyLoss(label_smoothing=smoothing)
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="max", patience=3, factor=0.5)
@@ -233,7 +264,6 @@ def train(args):
                 else:
                     xb, yb_type = [t.to(device) for t in batch]
                 xb = torch.nan_to_num(xb, nan=0.0, posinf=0.0, neginf=0.0)
-
                 lt, lf = model(xb)
                 pt = lt.argmax(1).cpu().numpy()
                 preds_type.extend(pt); truths_type.extend(yb_type.cpu().numpy())
@@ -253,7 +283,6 @@ def train(args):
         else:
             print(f"Epoch {epoch}/{args.epochs}  loss={total_loss/len(train_loader):.4f}  "
                   f"type: acc={acc_type:.3f} f1={f1_type:.3f}")
-
         sched.step(f1_type)
         if f1_type > best_f1 + 1e-4:
             best_f1 = f1_type; no_improve = 0
@@ -271,32 +300,37 @@ def train(args):
         print(classification_report(truths_form, preds_form, zero_division=0))
     print(f"\nBest model saved to {args.out_model}")
 
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_npz", default="dataset/windows_phase2.npz")
     ap.add_argument("--summary_csv", default="dataset/windows_phase2_summary.csv")
-    ap.add_argument("--out_model", default="model/phase2_cnn_bilstm_v6s.pt")
+    ap.add_argument("--out_model", default="model/phase2_cnn_bilstm_v6_grouped_strat.pt")
+
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
     ap.add_argument("--early_stop", type=int, default=7)
     ap.add_argument("--seed", type=int, default=42)
+
     ap.add_argument("--cnn_channels", type=int, default=256)
     ap.add_argument("--lstm_hidden", type=int, default=256)
     ap.add_argument("--lstm_layers", type=int, default=2)
     ap.add_argument("--dropout", type=float, default=0.5)
+
     ap.add_argument("--lambda_form", type=float, default=1.0)
     ap.add_argument("--label_smoothing", type=float, default=0.05)
     ap.add_argument("--grad_clip", type=float, default=1.0)
-    ap.add_argument("--grouped_split", type=int, default=1,
-                    help="1: grouped by video (no leakage); 0: stratified by window.")
-    ap.add_argument("--class_balance", action="store_true",
-                    help="Use class-balanced sampling / loss.")
-    ap.add_argument("--focal_loss", action="store_true",
-                    help="Use focal loss for TYPE head.")
-    ap.add_argument("--gamma", type=float, default=2.0,
-                    help="Focal loss gamma.")
+
+    ap.add_argument("--grouped_split", type=int, default=1,help="1: grouped by video (no leakage); 0: stratified by window.")
+    ap.add_argument("--grouped_strategy", choices=["random", "stratified"], default="stratified",help="How to pick val videos when grouped_split=1.")
+    ap.add_argument("--val_ratio", type=float, default=0.35,help="Validation ratio for grouped splits (increase so val videos ≥ #classes).")
+
+    ap.add_argument("--class_balance", action="store_true", help="Use class-balanced sampling / loss.")
+    ap.add_argument("--focal_loss", action="store_true", help="Use focal loss for TYPE head.")
+    ap.add_argument("--gamma", type=float, default=2.0, help="Focal loss gamma.")
+
     ap.add_argument("--augment", action="store_true")
     ap.add_argument("--time_shift", type=int, default=10)
     ap.add_argument("--time_mask_prob", type=float, default=0.2)
@@ -304,5 +338,7 @@ def parse_args():
     ap.add_argument("--feat_noise_std", type=float, default=0.02)
     return ap.parse_args()
 
+
 if __name__ == "__main__":
     train(parse_args())
+
