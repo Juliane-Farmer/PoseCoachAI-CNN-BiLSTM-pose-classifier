@@ -66,5 +66,9 @@ tzdata==2025.2
 urllib3==2.5.0
 uvicorn==0.35.0
 watchdog==6.0.0
-streamlit-webrtc 
+streamlit-webrtc
 seaborn==0.13.2
+torch
+torchvision
+torchaudio
+scikit-learn
