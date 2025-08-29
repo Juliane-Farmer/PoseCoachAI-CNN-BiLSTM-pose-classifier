@@ -31,25 +31,16 @@ def _build_logger():
 
 LOGGER = _build_logger()
 RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-
 SMOOTH_K = 6
 WARMUP_PAD = True
-UNKNOWN_THRESH = 0.55
 DEFAULT_SPEAK_GATE = 0.80
-BASE_MARGIN = 0.05
-EARLY_GUARD_STEPS = 15
 QUALITY_NEUTRALIZE_MAX = 0.35
 QUALITY_COVERAGE_MIN = 0.60
 MOV_RECORD_THRESH = 0.6
-MOV_ADOPT_THRESH = 1.2
-IDLE_HOLD_STEPS = 3
-RESET_UNKNOWN_STEPS = 3
-
-def margin_needed(p): return max(BASE_MARGIN, 0.5*(1.0 - float(p)))
-def steps_needed(p): return 3 if p < 0.70 else (2 if p < 0.85 else 1)
-
+SPEAK_COOLDOWN = 2.5
 VIS_THRESH = 0.5
 POSE_LM = mp.solutions.pose.PoseLandmark
+
 ANGLE_SPECS = {
     "right_elbow_angle": ("RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"),
     "left_elbow_angle":  ("LEFT_SHOULDER",  "LEFT_ELBOW",  "LEFT_WRIST"),
@@ -110,7 +101,7 @@ class OnlineFeatureBuilder:
             out[f"{n}_diff"] = diff; out[f"{n}_ma5"] = ma
         return out
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_engine():
     npz_path = ROOT / "dataset" / "windows_phase2_norm.npz"
     model_path = ROOT / "model" / "phase2_cnn_bilstm_v9.pt"
@@ -126,15 +117,13 @@ def load_engine():
     except ModuleNotFoundError:
         from train_coach_cnn import CNNBiLSTM
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CNNBiLSTM(in_feats=in_feats, cnn_channels=256, lstm_hidden=256, lstm_layers=2, dropout=0.5,
-                      num_type=int(y_type.max()+1), num_form=None).to(device)
+    model = CNNBiLSTM(in_feats=in_feats, cnn_channels=256, lstm_hidden=256, lstm_layers=2, dropout=0.5,num_type=int(y_type.max()+1), num_form=None).to(device)
     state = torch.load(model_path, map_location=device); model.load_state_dict(state); model.eval()
-    return {"model": model, "device": device, "mu": mu, "sd": sd, "feat_cols": list(map(str, feat_cols)),
-            "type_names": list(map(str, type_names)), "seq_len": int(seq_len)}
+    return {"model": model, "device": device, "mu": mu, "sd": sd, "feat_cols": list(map(str, feat_cols)), "type_names": list(map(str, type_names)), "seq_len": int(seq_len)}
 
 ENGINE = load_engine()
 
-def _base_of(n): 
+def _base_of(n):
     if n.endswith("_diff"): return n[:-5]
     if n.endswith("_ma5"): return n[:-4]
     return n
@@ -177,27 +166,27 @@ def visible_fraction(lm, names, thresh=0.5):
     return float(np.mean(vis)) if vis else 0.0
 
 class OverlayProcessor(VideoProcessorBase):
-    def __init__(self, selected="(auto)", speak=False, speak_gate=DEFAULT_SPEAK_GATE):
+    def __init__(self, selected, speak=False, speak_gate=DEFAULT_SPEAK_GATE, show_debug=False):
         self.selected = selected
+        self.show_debug = show_debug
         self.pose = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
         self.prob_hist = deque(maxlen=SMOOTH_K)
         self.feat_hist = deque(maxlen=SMOOTH_K)
         self.ready = False
         self.pose_present = deque(maxlen=15)
         self.last_label = "unknown"; self.last_conf = 0.0
-        self.cand_label = None; self.cand_steps = 0
-        self.unknown_steps = 0
         self.last_raw = {}; self.debug_top3 = ""
         self.speak = speak; self.speak_gate = speak_gate
         self._tts_lock = threading.Lock(); self._last_spoken = None
-        self._t_prev = time.time(); self._unk_boost_until = 0.0
+        self._last_tip = None; self._last_tip_t = 0.0
+        self._t_prev = time.time()
         self._builder = None; self._neut_frac = 0.0
-        self._knee_flex = 0; self._arms_up = deque(maxlen=16)
         self.status = "init"; self._coverage = 0.0; self._lower_cov = 0.0
-        self._mov_score = 0.0; self._idle_steps = 0
+        self._mov_score = 0.0
 
     def set_selected(self, s): self.selected = s
     def set_speak(self, enabled, gate=DEFAULT_SPEAK_GATE): self.speak = enabled; self.speak_gate = gate
+    def set_debug(self, val): self.show_debug = bool(val)
 
     def _say_async(self, text):
         def run():
@@ -233,10 +222,6 @@ class OverlayProcessor(VideoProcessorBase):
         if self._builder is None: self._builder = OnlineFeatureBuilder(REQUIRED_BASE, ma_window=5)
         feats = self._builder.push(feats_raw)
         self.last_raw = feats_raw.copy()
-        knee_min_now = min(self.last_raw.get("left_knee_angle", 180), self.last_raw.get("right_knee_angle", 180))
-        self._knee_flex = self._knee_flex + 1 if knee_min_now < 155 else max(0, self._knee_flex - 1)
-        arms_up_now = min(self.last_raw.get("left_shoulder_abd", 0), self.last_raw.get("right_shoulder_abd", 0)) > 105
-        self._arms_up.append(1 if arms_up_now else 0)
         mu_by_index = {i: float(ENGINE["mu"][i]) for i,_ in enumerate(ENGINE["feat_cols"])}
         v, neut_frac = _vec_from_feats(feats, ENGINE["feat_cols"], mu_by_index, set(UNCOMP_BASE))
         self._neut_frac = neut_frac; self.feat_hist.append(v)
@@ -248,10 +233,6 @@ class OverlayProcessor(VideoProcessorBase):
             self._mov_score = float(np.mean(np.abs(recent)))
         else:
             self._mov_score = 0.0
-
-        if self._mov_score < MOV_RECORD_THRESH: self._idle_steps += 1
-        else: self._idle_steps = 0
-
         if not self.ready:
             if (WARMUP_PAD and len(self.feat_hist) >= SMOOTH_K) or len(self.feat_hist) >= ENGINE["seq_len"]:
                 self.ready = True
@@ -273,114 +254,75 @@ class OverlayProcessor(VideoProcessorBase):
             if self._mov_score >= MOV_RECORD_THRESH:
                 self.prob_hist.append(probs)
             avg_probs = np.mean(np.stack(self.prob_hist, axis=0), axis=0) if len(self.prob_hist) else probs
-            top3_idx = avg_probs.argsort()[-3:][::-1]
-            self.debug_top3 = " | ".join(f"{ENGINE['type_names'][i]}:{avg_probs[i]*100:.0f}%" for i in top3_idx)
-            selected_key = str(self.selected).strip().lower()
-            stable_changed = False
 
-            if selected_key != "(auto)" and selected_key in {n.lower(): i for i, n in enumerate(ENGINE["type_names"])}:
-                idx = {n.lower(): i for i, n in enumerate(ENGINE["type_names"])}[selected_key]
-                self.last_label = ENGINE["type_names"][idx]; self.last_conf = float(avg_probs[idx])
+            idx_map = {n.lower(): i for i, n in enumerate(ENGINE["type_names"])}
+            sel_idx = idx_map.get(str(self.selected).strip().lower(), None)
+            if sel_idx is not None:
+                self.last_label = ENGINE["type_names"][sel_idx]
+                self.last_conf = float(avg_probs[sel_idx])
             else:
-                if self._mov_score < MOV_ADOPT_THRESH:
-                    candidate = "unknown"; avg_max = 0.0; avg_second = 0.0
-                else:
-                    top = int(avg_probs.argmax())
-                    second = int(np.argsort(avg_probs)[-2]) if avg_probs.size > 1 else top
-                    avg_max = float(avg_probs[top]); avg_second = float(avg_probs[second])
-                    eff_unknown = UNKNOWN_THRESH + (0.05 if time.time() < getattr(self, "_unk_boost_until", 0) else 0.0)
-                    candidate = "unknown" if avg_max < eff_unknown else ENGINE["type_names"][top]
-
-                if self._idle_steps >= IDLE_HOLD_STEPS: candidate = "unknown"
-
-                if len(self.prob_hist) < EARLY_GUARD_STEPS:
-                    cand_l = candidate.lower()
-                    if cand_l in ("russian twists", "russian twist"):
-                        tilt = float(self.last_raw.get("trunk_tilt", 0.0) or 0.0)
-                        if not (avg_max >= UNKNOWN_THRESH + 0.25 and tilt < 20.0):
-                            candidate = "unknown"
-
-                idx_map = {n.lower(): i for i, n in enumerate(ENGINE["type_names"])}
-                squat_idx = idx_map.get("squat", idx_map.get("squats", None))
-                jacks_idx = idx_map.get("jumping jacks", None)
-                strong_squat = self._knee_flex >= 6 and self._lower_cov >= 0.6 and self._neut_frac <= 0.3
-                arms_ratio = np.mean(self._arms_up) if len(self._arms_up) else 0.0
-                strong_jacks = (arms_ratio >= 0.4)
-
-                if candidate != "unknown":
-                    cl = candidate.lower()
-                    if cl in ("squat", "squats"):
-                        if not strong_squat: candidate = "unknown"
-                    elif cl == "jumping jacks":
-                        if not strong_jacks: candidate = "unknown"
-
-                if candidate != "unknown" and self.last_label == "unknown" and avg_max >= (UNKNOWN_THRESH + 0.10):
-                    self.last_label = candidate; self.last_conf = avg_max; stable_changed = True; self.cand_label, self.cand_steps = None, 0
-                else:
-                    if candidate != self.last_label:
-                        if candidate == self.cand_label: self.cand_steps += 1
-                        else: self.cand_label = candidate; self.cand_steps = 1
-                        need_steps = steps_needed(avg_max); need_margin = margin_needed(avg_max)
-                        if self.cand_steps >= need_steps and (candidate == "unknown" or (avg_max - avg_second) >= need_margin):
-                            self.last_label = candidate; self.last_conf = avg_max; stable_changed = True; self.cand_label, self.cand_steps = None, 0
-                    else:
-                        self.cand_label, self.cand_steps = None, 0
-
-                if self.last_label == "unknown": self.unknown_steps += 1
-                else: self.unknown_steps = 0
-                if self.unknown_steps >= RESET_UNKNOWN_STEPS:
-                    self.prob_hist.clear(); self.cand_label, self.cand_steps = None, 0; self._unk_boost_until = time.time() + 1.5
-
+                self.last_label = "unknown"; self.last_conf = 0.0
             self.status = "ok"
-            shown_ex = self.last_label if selected_key == "(auto)" else self.selected
-            tip = _simple_tip(shown_ex, self.last_raw); self.last_tip = tip if self.last_label != "unknown" else None
-            if self.speak and self.last_label != "unknown" and (stable_changed or self.last_conf >= self.speak_gate): self._say_async(self.last_tip or self.last_label)
+            tip = _simple_tip(self.last_label, self.last_raw)
+            self.last_tip = tip if self.last_label != "unknown" else None
+            now = time.time()
+            if self.speak and self.last_tip and self.last_conf >= self.speak_gate and (self.last_tip != self._last_tip or (now - self._last_tip_t) > SPEAK_COOLDOWN):
+                self._say_async(self.last_tip); self._last_tip = self.last_tip; self._last_tip_t = now
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
         else:
             self.status = "need_full_body" if not enough_pose else ("low_quality" if not quality_ok else "warming")
-            self.last_label = "unknown"; self.last_conf = 0.0; self.prob_hist.clear(); self.cand_label, self.cand_steps = None, 0
+            self.last_label = "unknown"; self.last_conf = 0.0; self.prob_hist.clear()
 
         y = 22
         color_status = (0, 165, 255) if self.status in ("no_pose", "need_full_body", "low_quality") else (255, 255, 255)
         cv2.putText(img, f"status: {self.status}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_status, 2); y += 22
         conf_txt = f"{self.last_conf*100:.1f}%" if self.last_label != "unknown" else "--"
         cv2.putText(img, f"pred: {self.last_label}  conf: {conf_txt}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2); y += 22
-        if self.debug_top3:
-            cv2.putText(img, f"top3: {self.debug_top3}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2); y += 22
+        if self.show_debug and avg_probs is not None:
+            top3_idx = avg_probs.argsort()[-3:][::-1]
+            debug_top3 = " | ".join(f"{ENGINE['type_names'][i]}:{avg_probs[i]*100:.0f}%" for i in top3_idx)
+            cv2.putText(img, f"top3: {debug_top3}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2); y += 22
         if fps is not None:
             cv2.putText(img, f"fps: {fps:.1f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2); y += 22
-        cv2.putText(img, f"neutralized: {int(self._neut_frac*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2); y += 22
-        cv2.putText(img, f"coverage: {int(self._coverage*100)}%  lower: {int(self._lower_cov*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2); y += 22
-        cv2.putText(img, f"motion:{self._mov_score:.2f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 200, 180), 2); y += 22
-        try:
-            if avg_probs is not None:
-                idx_map = {n.lower(): i for i, n in enumerate(ENGINE["type_names"])}
-                p_rt = float(avg_probs[idx_map.get("russian twists", idx_map.get("russian twist", -1))]) if idx_map.get("russian twists", idx_map.get("russian twist", -1)) not in (None, -1) else 0.0
-                p_sq = float(avg_probs[idx_map.get("squat", idx_map.get("squats", -1))]) if idx_map.get("squat", idx_map.get("squats", -1)) not in (None, -1) else 0.0
-            else:
-                p_rt = p_sq = 0.0
-            cv2.putText(img, f"p_squat={p_sq:.2f}  p_rt={p_rt:.2f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 255, 200), 2); y += 22
-        except Exception: pass
+        if self.show_debug:
+            cv2.putText(img, f"neutralized: {int(self._neut_frac*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2); y += 22
+            cv2.putText(img, f"coverage: {int(self._coverage*100)}%  lower: {int(self._lower_cov*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2); y += 22
+            cv2.putText(img, f"motion:{self._mov_score:.2f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 200, 180), 2); y += 22
+            try:
+                if avg_probs is not None:
+                    idx_map = {n.lower(): i for i, n in enumerate(ENGINE["type_names"])}
+                    p_rt = float(avg_probs[idx_map.get("russian twists", idx_map.get("russian twist", -1))]) if idx_map.get("russian twists", idx_map.get("russian twist", -1)) not in (None, -1) else 0.0
+                    p_sq = float(avg_probs[idx_map.get("squat", idx_map.get("squats", -1))]) if idx_map.get("squat", idx_map.get("squats", -1)) not in (None, -1) else 0.0
+                else:
+                    p_rt = p_sq = 0.0
+                cv2.putText(img, f"p_squat={p_sq:.2f}  p_rt={p_rt:.2f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 255, 200), 2); y += 22
+            except Exception:
+                pass
         return av.VideoFrame.from_ndarray(img, format="bgr24")
-
+    
 st.title("PoseCoachAI — Real-time Coach")
-col1, col2, col3 = st.columns([2, 1, 1])
+col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 with col1:
-    selected_ex = st.selectbox("Select exercise", options=ENGINE["type_names"] + ["(auto)"], index=len(ENGINE["type_names"]))
+    selected_ex = st.selectbox("Select exercise", options=ENGINE["type_names"], index=0)
 with col2:
     speak_enabled = st.toggle("Voice tips", value=False)
 with col3:
     speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05)
+with col4:
+    show_debug = st.toggle("Debug overlays", value=False)
+
 ctx = webrtc_streamer(
     key="posecoach",
     mode=WebRtcMode.SENDRECV,
     media_stream_constraints={"video": {"width": 640, "height": 360}, "audio": False},
-    video_processor_factory=lambda: OverlayProcessor(selected=selected_ex, speak=speak_enabled, speak_gate=speak_gate),
+    video_processor_factory=lambda: OverlayProcessor(
+        selected=selected_ex, speak=speak_enabled, speak_gate=speak_gate, show_debug=show_debug),
     rtc_configuration=RTC_CONFIGURATION,)
 
 
 if ctx.video_processor is not None:
     ctx.video_processor.set_selected(selected_ex)
     ctx.video_processor.set_speak(speak_enabled, gate=speak_gate)
+    ctx.video_processor.set_debug(show_debug)
 
 
