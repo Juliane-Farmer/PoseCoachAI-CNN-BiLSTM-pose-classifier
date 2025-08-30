@@ -24,18 +24,27 @@ if str(ROOT) not in sys.path:
 
 def _build_logger():
     logger = logging.getLogger("posecoach")
+    logger.setLevel(logging.INFO)
     logger.propagate = False
     if logger.handlers:
         return logger
     fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", "%H:%M:%S")
-    sh = logging.StreamHandler(sys.stdout); sh.setLevel(logging.INFO); sh.setFormatter(fmt); logger.addHandler(sh)
-    log_dir = ROOT / "outputs" / "session_logs"; log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = ROOT / "outputs" / "session_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"live_{int(time.time())}.log"
-    fh = logging.FileHandler(str(log_path), encoding="utf-8"); fh.setLevel(logging.INFO); fh.setFormatter(fmt); logger.addHandler(fh)
-    logger.info(f"Logging to {log_path}")
+    fh = logging.FileHandler(str(log_path), encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
     return logger
 
 LOGGER = _build_logger()
+
+def LOG(msg, level="info"):
+    line = f"{time.strftime('%H:%M:%S')} | {level.upper():7s} | {msg}"
+    print(line, flush=True)
+    getattr(LOGGER, level)(msg)
+
 RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 SMOOTH_K = 6
 WARMUP_PAD = False
@@ -92,6 +101,22 @@ def _trunk_tilt_deg(lm):
     cosang = float(np.clip(np.dot(torso, vertical), -1.0, 1.0))
     return float(np.degrees(np.arccos(cosang)))
 
+def _simple_tip(exercise, last_raw):
+    if not last_raw: return None
+    tilt = float(last_raw.get("trunk_tilt", 0.0) or 0.0)
+    ex = (exercise or "").lower()
+    if ex in ("squat", "squats"):
+        lk = float(last_raw.get("left_knee_angle", 180) or 180)
+        rk = float(last_raw.get("right_knee_angle", 180) or 180)
+        knee_min = min(lk, rk)
+        if knee_min > 160: return "Bend knees more"
+        if tilt > 25: return "Keep chest up"
+    elif ex in ("jumping jacks",):
+        l = float(last_raw.get("left_shoulder_abd", 90) or 90)
+        r = float(last_raw.get("right_shoulder_abd", 90) or 90)
+        if min(l, r) < 60: return "Raise arms higher"
+    return None
+
 class OnlineFeatureBuilder:
     def __init__(self, base_names, ma_window=5):
         self.base = list(base_names); self.prev = defaultdict(lambda: None)
@@ -129,6 +154,7 @@ def load_engine():
     return {"model": model, "device": device, "mu": mu, "sd": sd, "feat_cols": list(map(str, feat_cols)),"type_names": list(map(str, type_names)), "seq_len": int(seq_len)}
 
 ENGINE = load_engine()
+LOG("Logging initialized")
 
 def _base_of(n):
     if n.endswith("_diff"): return n[:-5]
@@ -138,7 +164,7 @@ def _base_of(n):
 REQUIRED_BASE = sorted({_base_of(n) for n in ENGINE["feat_cols"]} | {"trunk_tilt"})
 COMPUTABLE_BASE = set(ANGLE_SPECS.keys()) | {"trunk_tilt"}
 UNCOMP_BASE = sorted(b for b in REQUIRED_BASE if b not in COMPUTABLE_BASE)
-if UNCOMP_BASE: LOGGER.warning("Neutralizing uncomputable bases: %s", ", ".join(UNCOMP_BASE))
+if UNCOMP_BASE: LOG(f"Neutralizing uncomputable bases: {', '.join(UNCOMP_BASE)}")
 
 def _vec_from_feats(frame_feats, feat_cols, mu_by_index, uncomputable_bases):
     v = np.zeros((len(feat_cols),), dtype=np.float32); neutralized = 0
@@ -152,13 +178,6 @@ def _vec_from_feats(frame_feats, feat_cols, mu_by_index, uncomputable_bases):
             v[i] = float(x)
     return v, neutralized / max(1, len(feat_cols))
 
-def visible_fraction(lm, names, thresh=0.5):
-    if lm is None: return 0.0
-    vis = []
-    for n in names:
-        _, v = _get_xyzv(lm, n); vis.append(v >= thresh)
-    return float(np.mean(vis)) if vis else 0.0
-
 class TTSWorker:
     def __init__(self):
         self.q = queue.Queue()
@@ -166,10 +185,8 @@ class TTSWorker:
         self.t.start()
     def say(self, text):
         try:
-            if text:
-                self.q.put_nowait(text)
-        except Exception:
-            pass
+            if text: self.q.put_nowait(text)
+        except Exception: pass
     def _loop(self):
         try:
             import pyttsx3
@@ -177,11 +194,12 @@ class TTSWorker:
             while True:
                 text = self.q.get()
                 try:
-                    engine.say(text)
-                    engine.runAndWait()
-                except Exception:
-                    pass
-        except Exception:
+                    LOG(f"tip | {text}")
+                    engine.say(text); engine.runAndWait()
+                except Exception as e:
+                    LOG(f"TTS error: {e}", level="error")
+        except Exception as e:
+            LOG(f"TTS init failed: {e}", level="error")
             while True:
                 _ = self.q.get()
 
@@ -206,22 +224,36 @@ class OverlayProcessor(VideoProcessorBase):
         self._announced_ready = False
         self._last_tip = None; self._last_tip_t = 0.0
         self.coach = FormCoach()
+        self._last_status = None
 
     def set_selected(self, s):
         self.selected = s
         self._announced_ready = False
         self._last_tip = None
         self._last_tip_t = 0.0
+        LOG(f"ui | selected={self.selected}")
 
     def set_speak(self, enabled, gate=DEFAULT_SPEAK_GATE):
         self.speak = enabled; self.speak_gate = gate
+        LOG(f"ui | speak={self.speak} gate={self.speak_gate:.2f}")
 
     def set_debug(self, val):
         self.show_debug = bool(val)
+        LOG(f"ui | debug={self.show_debug}")
 
-    def _say(self, text):
-        TTS.say(text)
-        LOGGER.info(f"voice | {text}")
+    def _speak_if_ok(self, tip):
+        reasons = []
+        if not self.speak: reasons.append("speak=False")
+        if self._coverage < 0.50: reasons.append(f"cov={self._coverage:.2f}<0.50")
+        if self._mov_score < 0.20: reasons.append(f"mov={self._mov_score:.2f}<0.20")
+        if self.last_conf < self.speak_gate: reasons.append(f"conf={self.last_conf:.2f}<gate={self.speak_gate:.2f}")
+        if not tip: reasons.append("no-tip")
+        if reasons:
+            LOG("speak_skip | " + ", ".join(reasons))
+        else:
+            TTS.say(tip)
+            self._last_tip = tip
+            self._last_tip_t = time.time()
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         fps = None
@@ -231,13 +263,10 @@ class OverlayProcessor(VideoProcessorBase):
         has_pose = bool(res.pose_landmarks); self.pose_present.append(has_pose)
         lm = res.pose_landmarks.landmark if has_pose else None
         all_joints = sorted(set(sum([list(v) for v in REQUIRED_JOINTS.values()], [])))
-        self._coverage = visible_fraction(lm, all_joints, thresh=0.5) if has_pose else 0.0
-        self._lower_cov = visible_fraction(lm, REQUIRED_JOINTS["squat"], thresh=0.5) if has_pose else 0.0
+        self._coverage = (np.mean([(_get_xyzv(lm, n)[1] >= VIS_THRESH) for n in all_joints]) if has_pose else 0.0)
+        self._lower_cov = (np.mean([(_get_xyzv(lm, n)[1] >= VIS_THRESH) for n in REQUIRED_JOINTS["squat"]]) if has_pose else 0.0)
         feats_raw = {}
         if has_pose:
-            for n in ["LEFT_WRIST","RIGHT_WRIST","LEFT_EAR","RIGHT_EAR","NOSE"]:
-                xyz, vis = _get_xyzv(lm, n)
-                feats_raw[f"{n.lower()}_y"] = float(xyz[1]) if vis >= VIS_THRESH else np.nan
             for base in REQUIRED_BASE:
                 if base == "trunk_tilt":
                     feats_raw["trunk_tilt"] = _trunk_tilt_deg(lm)
@@ -263,6 +292,7 @@ class OverlayProcessor(VideoProcessorBase):
         if not self.ready:
             if (not WARMUP_PAD and len(self.feat_hist) >= ENGINE["seq_len"]) or (WARMUP_PAD and len(self.feat_hist) >= SMOOTH_K):
                 self.ready = True
+                LOG("engine | ready")
             else:
                 self.status = "need_full_body" if not enough_pose else "warming"
         avg_probs = None
@@ -285,25 +315,32 @@ class OverlayProcessor(VideoProcessorBase):
 
             self.status = "ok"
             tip = self.coach.update(self.last_label, self.last_raw, mov=self._mov_score, coverage=self._coverage)
+            if not tip:
+                tip = _simple_tip(self.last_label, self.last_raw)
             self.last_tip = tip if self.last_label != "unknown" else None
+            if self.show_debug and avg_probs is not None:
+                top3_idx = avg_probs.argsort()[-3:][::-1]
+                top3_str = ", ".join(f"{ENGINE['type_names'][i]}={avg_probs[i]:.2f}" for i in top3_idx)
+                LOG(f"top3 | {top3_str}")
+
+            LOG(f"pred={self.last_label} conf={self.last_conf:.3f} mov={self._mov_score:.2f} cov={self._coverage:.2f} neut={self._neut_frac:.2f} status={self.status}")
             now = time.time()
-            spoke = False
-            if self.speak and (self._coverage >= 0.5) and (self._mov_score >= 0.2):
-                if not self._announced_ready:
-                    self._say(f"{self.last_label} ready")
+            if self.speak:
+                if not self._announced_ready and self.last_conf >= self.speak_gate and self._coverage >= 0.5:
+                    TTS.say(f"{self.last_label} ready")
                     self._announced_ready = True
-                    spoke = True
-                if self.last_tip and (self.last_tip != (self._last_tip or None) or (now - self._last_tip_t) > SPEAK_COOLDOWN):
-                    self._say(self.last_tip)
-                    self._last_tip = self.last_tip
                     self._last_tip_t = now
-                    spoke = True
-                if not spoke and (now - self._last_tip_t) > (SPEAK_COOLDOWN * 2) and self._mov_score > 0.5:
-                    self._say("Keep going")
-                    self._last_tip_t = now
+                if self.last_tip and (self.last_conf >= self.speak_gate) and (now - self._last_tip_t > SPEAK_COOLDOWN) and self._coverage >= 0.5 and self._mov_score >= 0.2:
+                    self._speak_if_ok(self.last_tip)
+                elif (now - self._last_tip_t) > (SPEAK_COOLDOWN * 2) and self._mov_score > 0.5 and self._coverage >= 0.5:
+                    self._speak_if_ok("Keep going")
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
         else:
+            self.prob_hist.clear()
             self.status = "need_full_body" if not enough_pose else ("low_quality" if not quality_ok else ("warming" if not self.ready else "idle"))
+            if self.status != getattr(self, "_last_status", None):
+                LOG(f"status={self.status} cov={self._coverage:.2f} neut={self._neut_frac:.2f} mov={self._mov_score:.2f}")
+                self._last_status = self.status
             self.last_conf = 0.0
             avg_probs = None
 
@@ -312,12 +349,12 @@ class OverlayProcessor(VideoProcessorBase):
         cv2.putText(img, f"status: {self.status}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_status, 2); y += 22
         conf_txt = f"{self.last_conf*100:.1f}%" if self.last_label != "unknown" and self.status == "ok" else "--"
         cv2.putText(img, f"pred: {self.selected}  conf: {conf_txt}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2); y += 22
+        fps = 1.0 / max(1e-6, (time.time() - getattr(self, "_t_prev", time.time()))) if fps is None else fps
+        cv2.putText(img, f"fps: {fps:.1f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2); y += 22
         if self.show_debug and avg_probs is not None:
             top3_idx = avg_probs.argsort()[-3:][::-1]
             debug_top3 = " | ".join(f"{ENGINE['type_names'][i]}:{avg_probs[i]*100:.0f}%" for i in top3_idx)
             cv2.putText(img, f"top3: {debug_top3}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2); y += 22
-        if fps is not None:
-            cv2.putText(img, f"fps: {fps:.1f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2); y += 22
         if self.show_debug:
             cv2.putText(img, f"neutralized: {int(self._neut_frac*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2); y += 22
             cv2.putText(img, f"coverage: {int(self._coverage*100)}%  lower: {int(self._lower_cov*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2); y += 22
@@ -347,5 +384,3 @@ if ctx.video_processor is not None:
     ctx.video_processor.set_selected(selected_ex)
     ctx.video_processor.set_speak(speak_enabled, gate=speak_gate)
     ctx.video_processor.set_debug(show_debug)
-
-
