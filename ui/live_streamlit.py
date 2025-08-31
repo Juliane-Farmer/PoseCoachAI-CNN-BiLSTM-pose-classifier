@@ -23,15 +23,9 @@ try:
 except Exception:
     tips_from_phase_events = None
 
-from pathlib import Path
-HTML_PATH = Path(__file__).parent / "components" / "browser_tts.html"
-
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-HTML_PATH = Path(__file__).parent / "components" / "browser_tts.html"
 
 def _build_logger():
     logger = logging.getLogger("posecoach")
@@ -57,8 +51,6 @@ def LOG(msg, level="info"):
     getattr(LOGGER, level)(msg)
 
 RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-
-
 SMOOTH_K_DEFAULT = 6
 WARMUP_PAD = True
 DEFAULT_SPEAK_GATE = 0.30
@@ -164,9 +156,15 @@ def load_engine():
     model = CNNBiLSTM(in_feats=in_feats, cnn_channels=256, lstm_hidden=256, lstm_layers=2,
                       dropout=0.5, num_type=int(y_type.max()+1), num_form=None).to(device)
     state = torch.load(model_path, map_location=device); model.load_state_dict(state); model.eval()
-    return {"model": model, "device": device, "mu": mu, "sd": sd,
-            "feat_cols": list(map(str, feat_cols)), "type_names": list(map(str, type_names)),
-            "seq_len": int(seq_len)}
+    return {
+        "model": model,
+        "device": device,
+        "mu": mu,
+        "sd": sd,
+        "feat_cols": list(map(str, feat_cols)),
+        "type_names": list(map(str, type_names)),
+        "seq_len": int(seq_len),
+    }
 
 ENGINE = load_engine()
 LOG("Logging initialized")
@@ -185,14 +183,14 @@ def _vec_from_feats(frame_feats, feat_cols, mu_by_index, uncomputable_bases):
     v = np.zeros((len(feat_cols),), dtype=np.float32); neutralized = 0
     for i, name in enumerate(feat_cols):
         base = _base_of(name)
-        if base in uncomputable_bases: v[i] = mu_by_index[i]; neutralized += 1; continue
+        if base in uncomputable_bases:
+            v[i] = mu_by_index[i]; neutralized += 1; continue
         x = frame_feats.get(name, np.nan)
         if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
             v[i] = mu_by_index[i]; neutralized += 1
         else:
             v[i] = float(x)
     return v, neutralized / max(1, len(feat_cols))
-
 
 INFER_SEQ_LEN_DEFAULT = max(40, min(ENGINE["seq_len"], 64))
 
@@ -220,6 +218,7 @@ class OverlayProcessor(VideoProcessorBase):
         self.coach = FormCoach()  
         self._last_status = None
         self.speak_fn = speak_fn or (lambda _txt: None)
+
         self.frame_i = 0
         self.squat_pd = SquatPhaseDetector() if SquatPhaseDetector else None
         self.jacks_pd = JacksPhaseDetector() if JacksPhaseDetector else None
@@ -240,7 +239,6 @@ class OverlayProcessor(VideoProcessorBase):
         LOG(f"ui | debug={self.show_debug}")
 
     def set_params(self, infer_seq_len=None, smooth_k=None):
-        """Allow live tuning of tail length and smoothing."""
         if infer_seq_len and int(infer_seq_len) != self.feat_hist.maxlen:
             new_len = int(infer_seq_len)
             old = list(self.feat_hist)[-new_len:]
@@ -250,18 +248,25 @@ class OverlayProcessor(VideoProcessorBase):
             old = list(self.prob_hist)[-new_len:]
             self.prob_hist = deque(old, maxlen=new_len)
 
-    def _speak_if_ok(self, tip):
+    def _speak_if_ok(self, tip, ignore_conf=False):
         reasons = []
-        if not self.speak: reasons.append("speak=False")
-        if self._coverage < 0.50: reasons.append(f"cov={self._coverage:.2f}<0.50")
-        if self.last_conf < self.speak_gate: reasons.append(f"conf={self.last_conf:.2f}<gate={self.speak_gate:.2f}")
-        if not tip: reasons.append("no-tip")
+        if not self.speak:
+            reasons.append("speak=False")
+        if self._coverage < 0.50:
+            reasons.append(f"cov={self._coverage:.2f}<0.50")
+        if (not ignore_conf) and (self.last_conf < self.speak_gate):
+            reasons.append(f"conf={self.last_conf:.2f}<gate={self.speak_gate:.2f}")
+        if not tip:
+            reasons.append("no-tip")
+
         if reasons:
             LOG("speak_skip | " + ", ".join(reasons))
-        else:
-            self.speak_fn(tip)
-            self._last_tip = tip
-            self._last_tip_t = time.time()
+            return
+
+        self.speak_fn(tip)
+        self._last_tip = tip
+        self._last_tip_t = time.time()
+        LOG(f"speak | {tip}")
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         self.frame_i += 1
@@ -287,9 +292,11 @@ class OverlayProcessor(VideoProcessorBase):
         if self._builder is None: self._builder = OnlineFeatureBuilder(REQUIRED_BASE, ma_window=5)
         feats = self._builder.push(feats_raw)
         self.last_raw = feats_raw.copy()
+
         mu_by_index = {i: float(ENGINE["mu"][i]) for i,_ in enumerate(ENGINE["feat_cols"])}
         v, neut_frac = _vec_from_feats(feats, ENGINE["feat_cols"], mu_by_index, set(UNCOMP_BASE))
         self._neut_frac = neut_frac; self.feat_hist.append(v)
+
         enough_pose = np.mean(list(self.pose_present)) >= 0.5
         quality_ok = (self._coverage >= QUALITY_COVERAGE_MIN) and (self._neut_frac <= QUALITY_NEUTRALIZE_MAX)
 
@@ -333,6 +340,7 @@ class OverlayProcessor(VideoProcessorBase):
                 self.last_conf = float(avg_probs[sel_idx])
             else:
                 self.last_label = "unknown"; self.last_conf = 0.0
+
             self.status = "ok"
             tip = self.coach.update(self.last_label, self.last_raw, mov=self._mov_score, coverage=self._coverage)
             if (not tip) and tips_from_phase_events and (self.squat_pd or self.jacks_pd):
@@ -370,14 +378,14 @@ class OverlayProcessor(VideoProcessorBase):
 
             now = time.time()
             if self.speak:
-                if not self._announced_ready and self.last_conf >= self.speak_gate and self._coverage >= 0.5:
+                if (not self._announced_ready) and (self.last_conf >= self.speak_gate) and (self._coverage >= 0.5):
                     self.speak_fn(f"{self.last_label} ready")
                     self._announced_ready = True
                     self._last_tip_t = now
-                if self.last_tip and (self.last_conf >= self.speak_gate) and (now - self._last_tip_t > SPEAK_COOLDOWN) and self._coverage >= 0.5:
+                if self.last_tip and (now - self._last_tip_t > SPEAK_COOLDOWN) and (self._coverage >= 0.5):
                     self._speak_if_ok(self.last_tip)
-                elif (now - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and self._coverage >= 0.5 and self._mov_score > 0.4:
-                    self._speak_if_ok("Keep going")
+                elif (now - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and (self._coverage >= 0.5) and (self._mov_score > 0.4):
+                    self._speak_if_ok("Keep going", ignore_conf=True)
 
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
         else:
@@ -407,16 +415,26 @@ class OverlayProcessor(VideoProcessorBase):
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 st.title("PoseCoachAI — Real-time Coach")
-use_browser_tts = st.sidebar.toggle("Use browser TTS (no server audio device)", value=True)
+
 INFER_SEQ_LEN_SLIDER = st.sidebar.slider("Infer seq length (frames)", 48, 96, INFER_SEQ_LEN_DEFAULT, step=8)
 SMOOTH_K_SLIDER = st.sidebar.slider("Smoothing K", 1, 12, SMOOTH_K_DEFAULT)
-tts = TTS(prefer_browser=use_browser_tts, html_path=str(HTML_PATH))
-tts.controls()
+
+@st.cache_resource(show_spinner=False)
+def get_tts(cache_buster: int = 6):  
+    from tts import TTS
+    return TTS(prefer_browser=False, rate=165, volume=1.0, beep=True)
+
+tts = get_tts()
+if st.button("Speak test"):
+    tts.say("This is a PoseCoach test.")
+
+LOG("tts_backend=server")
+
 col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 with col1:
     selected_ex = st.selectbox("Select exercise", options=ENGINE["type_names"], index=0)
 with col2:
-    speak_enabled = st.toggle("Voice tips", value=False)
+    speak_enabled = st.toggle("Voice tips", value=True)
 with col3:
     speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05)
 with col4:
@@ -433,16 +451,15 @@ ctx = webrtc_streamer(
         show_debug=show_debug,
         speak_fn=tts.say,
         infer_seq_len=INFER_SEQ_LEN_SLIDER,
-        smooth_k=SMOOTH_K_SLIDER,
-    ),
-    rtc_configuration=RTC_CONFIGURATION,
-)
+        smooth_k=SMOOTH_K_SLIDER,),
+    rtc_configuration=RTC_CONFIGURATION,)
+
 
 if ctx.video_processor is not None:
     ctx.video_processor.set_selected(selected_ex)
     ctx.video_processor.set_speak(speak_enabled, gate=speak_gate)
     ctx.video_processor.set_debug(show_debug)
     ctx.video_processor.set_params(infer_seq_len=INFER_SEQ_LEN_SLIDER, smooth_k=SMOOTH_K_SLIDER)
-
+    ctx.video_processor.speak_fn = tts.say
 
 tts.render()
