@@ -1,83 +1,127 @@
-from __future__ import annotations
-import uuid, pathlib
-import streamlit as st
-import streamlit.components.v1 as components
+import threading, queue, time, logging, sys
 
+try:
+    import pyttsx3
+except Exception:
+    pyttsx3 = None
 
-class BrowserTTS:
-    def __init__(self, html_path: str):
-        self.html_path = html_path
-        ss = st.session_state
-        ss.setdefault("tts_queue", [])
-        ss.setdefault("tts_rate", 1.0)
-        ss.setdefault("tts_pitch", 1.0)
-        ss.setdefault("tts_volume", 1.0)
-        ss.setdefault("tts_voice_pref", "")
+try:
+    import pythoncom
+except Exception:
+    pythoncom = None
 
-    def enqueue(self, text: str):
-        if text and text.strip():
-            st.session_state["tts_queue"].append({"token": str(uuid.uuid4()), "text": text})
+try:
+    import winsound
+except Exception:
+    winsound = None
 
-    def _fill(self, text: str, token: str) -> str:
-        html = pathlib.Path(self.html_path).read_text(encoding="utf-8")
-        repl = {
-            "[[TEXT]]": (text or "").replace("\\", "\\\\").replace('"', '\\"'),
-            "[[TOKEN]]": token,
-            "[[RATE]]": str(st.session_state["tts_rate"]),
-            "[[PITCH]]": str(st.session_state["tts_pitch"]),
-            "[[VOLUME]]": str(st.session_state["tts_volume"]),
-            "[[VOICE_SUBSTR]]": st.session_state["tts_voice_pref"].replace('"', '\\"'), }
-        for k, v in repl.items():
-            html = html.replace(k, v)
-        return html
+LOG = logging.getLogger("posecoach.tts")
+if not LOG.handlers:
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", "%H:%M:%S"))
+    LOG.addHandler(h)
+LOG.setLevel(logging.INFO)
 
-    def render(self):
-        q = st.session_state.get("tts_queue", [])
-        if q:
-            item = q.pop(0)
-            html = self._fill(item["text"], item["token"])
-        else:
-            html = self._fill("", "noop")
-        components.html(html, height=0, scrolling=False, key="browser-tts")
-
-class ServerTTS:
-    def __init__(self):
-        try:
-            import pyttsx3
-            self.engine = pyttsx3.init()
-            self.engine.setProperty("rate", 175)
-        except Exception:
-            self.engine = None
-
-    def enqueue(self, text: str):
-        if not text or not text.strip() or self.engine is None: return
-        try: self.engine.say(text); self.engine.runAndWait()
-        except Exception: pass
-
-    def render(self): pass
 
 class TTS:
-    def __init__(self, prefer_browser: bool = True, html_path: str = "app/components/browser_tts.html"):
-        self.browser = BrowserTTS(html_path) if prefer_browser else None
-        self.server  = ServerTTS()
+  
+    def __init__(self, prefer_browser: bool = False, rate: int = 180, volume: float = 1.0,
+                 voice: str | None = None, beep: bool = True):
+        if pyttsx3 is None:
+            raise RuntimeError("pyttsx3 is not installed; server TTS unavailable")
 
-    def controls(self):
-        with st.sidebar.expander("Voice (browser TTS)", expanded=False):
-            st.session_state["tts_rate"] = st.slider("Rate", 0.5, 2.0, st.session_state["tts_rate"], 0.05)
-            st.session_state["tts_pitch"] = st.slider("Pitch", 0.5, 1.5, st.session_state["tts_pitch"], 0.05)
-            st.session_state["tts_volume"] = st.slider("Volume", 0.0, 1.0, st.session_state["tts_volume"], 0.05)
-            st.session_state["tts_voice_pref"] = st.text_input("Voice contains… (name/lang)", st.session_state["tts_voice_pref"])
+        self._q: queue.Queue[str | None] = queue.Queue()
+        self._alive = True
+        self._cfg = {"rate": rate, "volume": float(volume), "voice": voice}
+        self._beep = bool(beep)
+        self._prefer_browser = prefer_browser  
+
+        self._worker = threading.Thread(target=self._run, name="tts-worker", daemon=True)
+        self._worker.start()
+        LOG.info("ServerTTS worker started")
+
+    def _run(self):
+        engine = None
+        if pythoncom is not None:
+            try:
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+
+        try:
+            try:
+                engine = pyttsx3.init(driverName="sapi5")  
+            except Exception:
+                engine = pyttsx3.init()
+
+            try:
+                engine.setProperty("rate", self._cfg["rate"])
+                engine.setProperty("volume", self._cfg["volume"])
+                if self._cfg["voice"] is not None:
+                    engine.setProperty("voice", self._cfg["voice"])
+            except Exception:
+                pass
+
+            while self._alive:
+                try:
+                    text = self._q.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                if text is None:
+                    break
+
+                try:
+                    if self._beep and winsound is not None:
+                        try:
+                            winsound.Beep(1000, 120)  
+                        except Exception:
+                            pass
+
+                    LOG.info(f"tts_start  | {text}")
+                    engine.say(text)
+                    engine.runAndWait()
+                    LOG.info(f"tts_played | {text}")
+                    time.sleep(0.05)  
+                except Exception as e:
+                    LOG.error(f"TTS error: {e}")
+
+        finally:
+            try:
+                if engine is not None:
+                    engine.stop()
+            except Exception:
+                pass
+            if pythoncom is not None:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+            LOG.info("ServerTTS worker stopped")
 
     def say(self, text: str):
-        if self.browser is not None: self.browser.enqueue(text)
-        else: self.server.enqueue(text)
+        """Flush queued-but-not-started items and enqueue `text` next."""
+        if not text:
+            return
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+        self._q.put(text)
 
-def render(self):
-    q = st.session_state.get("tts_queue", [])
-    if q:
-        item = q.pop(0)
-        html = self._fill_template(item["text"], item["token"])
-    else:
-        html = self._fill_template("", "noop")
-    components.html(html, height=1, scrolling=False)
+    def controls(self): 
+        return None
 
+    def render(self):    
+        return None
+
+    def close(self):
+        self._alive = False
+        try:
+            self._q.put(None)
+        except Exception:
+            pass
+        try:
+            self._worker.join(timeout=1.0)
+        except Exception:
+            pass
