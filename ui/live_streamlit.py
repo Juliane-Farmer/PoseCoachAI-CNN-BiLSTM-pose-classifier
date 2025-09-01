@@ -163,8 +163,7 @@ def load_engine():
         "sd": sd,
         "feat_cols": list(map(str, feat_cols)),
         "type_names": list(map(str, type_names)),
-        "seq_len": int(seq_len),
-    }
+        "seq_len": int(seq_len)}
 
 ENGINE = load_engine()
 LOG("Logging initialized")
@@ -177,7 +176,8 @@ def _base_of(n):
 REQUIRED_BASE = sorted({_base_of(n) for n in ENGINE["feat_cols"]} | {"trunk_tilt"})
 COMPUTABLE_BASE = set(ANGLE_SPECS.keys()) | {"trunk_tilt"}
 UNCOMP_BASE = sorted(b for b in REQUIRED_BASE if b not in COMPUTABLE_BASE)
-if UNCOMP_BASE: LOG(f"Neutralizing uncomputable bases: {', '.join(UNCOMP_BASE)}")
+if UNCOMP_BASE:
+    LOG(f"Neutralizing uncomputable bases: {', '.join(UNCOMP_BASE)}")
 
 def _vec_from_feats(frame_feats, feat_cols, mu_by_index, uncomputable_bases):
     v = np.zeros((len(feat_cols),), dtype=np.float32); neutralized = 0
@@ -195,8 +195,7 @@ def _vec_from_feats(frame_feats, feat_cols, mu_by_index, uncomputable_bases):
 INFER_SEQ_LEN_DEFAULT = max(40, min(ENGINE["seq_len"], 64))
 
 class OverlayProcessor(VideoProcessorBase):
-    def __init__(self, selected, speak=False, speak_gate=DEFAULT_SPEAK_GATE, show_debug=False,
-                 speak_fn=None, infer_seq_len=INFER_SEQ_LEN_DEFAULT, smooth_k=SMOOTH_K_DEFAULT):
+    def __init__(self, selected, speak=False, speak_gate=DEFAULT_SPEAK_GATE, show_debug=False,speak_fn=None, infer_seq_len=INFER_SEQ_LEN_DEFAULT, smooth_k=SMOOTH_K_DEFAULT):
         self.selected = selected
         self.show_debug = show_debug
         self.pose = mp.solutions.pose.Pose(model_complexity=0, min_detection_confidence=0.5, min_tracking_confidence=0.5)
@@ -215,7 +214,7 @@ class OverlayProcessor(VideoProcessorBase):
         self._mov_score = 0.0
         self._announced_ready = False
         self._last_tip = None; self._last_tip_t = 0.0
-        self.coach = FormCoach()  
+        self.coach = FormCoach()
         self._last_status = None
         self.speak_fn = speak_fn or (lambda _txt: None)
 
@@ -258,11 +257,9 @@ class OverlayProcessor(VideoProcessorBase):
             reasons.append(f"conf={self.last_conf:.2f}<gate={self.speak_gate:.2f}")
         if not tip:
             reasons.append("no-tip")
-
         if reasons:
             LOG("speak_skip | " + ", ".join(reasons))
             return
-
         self.speak_fn(tip)
         self._last_tip = tip
         self._last_tip_t = time.time()
@@ -279,7 +276,6 @@ class OverlayProcessor(VideoProcessorBase):
         all_joints = sorted(set(sum([list(v) for v in REQUIRED_JOINTS.values()], [])))
         self._coverage = (np.mean([(_get_xyzv(lm, n)[1] >= VIS_THRESH) for n in all_joints]) if has_pose else 0.0)
         self._lower_cov = (np.mean([(_get_xyzv(lm, n)[1] >= VIS_THRESH) for n in REQUIRED_JOINTS["squat"]]) if has_pose else 0.0)
-
         feats_raw = {}
         if has_pose:
             for base in REQUIRED_BASE:
@@ -287,16 +283,16 @@ class OverlayProcessor(VideoProcessorBase):
                     feats_raw["trunk_tilt"] = _trunk_tilt_deg(lm)
                 elif base in ANGLE_SPECS:
                     A, B, C = ANGLE_SPECS[base]; feats_raw[base] = _safe_joint_angle(lm, A, B, C)
-        for b in REQUIRED_BASE: feats_raw.setdefault(b, np.nan)
+        for b in REQUIRED_BASE:
+            feats_raw.setdefault(b, np.nan)
 
-        if self._builder is None: self._builder = OnlineFeatureBuilder(REQUIRED_BASE, ma_window=5)
+        if self._builder is None:
+            self._builder = OnlineFeatureBuilder(REQUIRED_BASE, ma_window=5)
         feats = self._builder.push(feats_raw)
         self.last_raw = feats_raw.copy()
-
         mu_by_index = {i: float(ENGINE["mu"][i]) for i,_ in enumerate(ENGINE["feat_cols"])}
         v, neut_frac = _vec_from_feats(feats, ENGINE["feat_cols"], mu_by_index, set(UNCOMP_BASE))
         self._neut_frac = neut_frac; self.feat_hist.append(v)
-
         enough_pose = np.mean(list(self.pose_present)) >= 0.5
         quality_ok = (self._coverage >= QUALITY_COVERAGE_MIN) and (self._neut_frac <= QUALITY_NEUTRALIZE_MAX)
 
@@ -305,7 +301,6 @@ class OverlayProcessor(VideoProcessorBase):
             self._mov_score = float(np.mean(np.abs(recent)))
         else:
             self._mov_score = 0.0
-
         if not self.ready:
             if (WARMUP_PAD and len(self.feat_hist) >= self.prob_hist.maxlen) or (len(self.feat_hist) >= 12):
                 self.ready = True
@@ -416,29 +411,40 @@ class OverlayProcessor(VideoProcessorBase):
 
 st.title("PoseCoachAI — Real-time Coach")
 
-INFER_SEQ_LEN_SLIDER = st.sidebar.slider("Infer seq length (frames)", 48, 96, INFER_SEQ_LEN_DEFAULT, step=8)
-SMOOTH_K_SLIDER = st.sidebar.slider("Smoothing K", 1, 12, SMOOTH_K_DEFAULT)
-
 @st.cache_resource(show_spinner=False)
-def get_tts(cache_buster: int = 6):  
-    from tts import TTS
-    return TTS(prefer_browser=False, rate=165, volume=1.0, beep=True)
+def get_tts(cache_buster: int = 7):
+    return TTS(prefer_browser=False, rate=165, volume=1.0, beep=False)
 
 tts = get_tts()
-if st.button("Speak test"):
-    tts.say("This is a PoseCoach test.")
+
+cols_test = st.columns([1, 1, 2, 2])
+with cols_test[0]:
+    if st.button("Speak test", key="speak_test_debug"):
+        tts.say("This is a PoseCoach test.")
+with cols_test[1]:
+    beep_debug = st.toggle("Beep (debug)", value=False, key="beep_toggle_debug")
+    try:
+        tts.set_beep(beep_debug)
+    except AttributeError:
+        pass  
+with cols_test[2]:
+    if st.button("Beep test only", key="beep_test_only"):
+        try:
+            tts.beep_once()
+        except AttributeError:
+            pass
 
 LOG("tts_backend=server")
 
 col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 with col1:
-    selected_ex = st.selectbox("Select exercise", options=ENGINE["type_names"], index=0)
+    selected_ex = st.selectbox("Select exercise", options=ENGINE["type_names"], index=0, key="ex_select")
 with col2:
-    speak_enabled = st.toggle("Voice tips", value=True)
+    speak_enabled = st.toggle("Voice tips", value=True, key="voice_tips_toggle")
 with col3:
-    speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05)
+    speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05, key="speak_gate_slider")
 with col4:
-    show_debug = st.toggle("Debug overlays", value=False)
+    show_debug = st.toggle("Debug overlays", value=False, key="debug_overlay_toggle")
 
 ctx = webrtc_streamer(
     key="posecoach",
@@ -450,16 +456,14 @@ ctx = webrtc_streamer(
         speak_gate=speak_gate,
         show_debug=show_debug,
         speak_fn=tts.say,
-        infer_seq_len=INFER_SEQ_LEN_SLIDER,
-        smooth_k=SMOOTH_K_SLIDER,),
+        infer_seq_len=INFER_SEQ_LEN_DEFAULT,
+        smooth_k=SMOOTH_K_DEFAULT,),
     rtc_configuration=RTC_CONFIGURATION,)
-
 
 if ctx.video_processor is not None:
     ctx.video_processor.set_selected(selected_ex)
     ctx.video_processor.set_speak(speak_enabled, gate=speak_gate)
     ctx.video_processor.set_debug(show_debug)
-    ctx.video_processor.set_params(infer_seq_len=INFER_SEQ_LEN_SLIDER, smooth_k=SMOOTH_K_SLIDER)
     ctx.video_processor.speak_fn = tts.say
 
 tts.render()
