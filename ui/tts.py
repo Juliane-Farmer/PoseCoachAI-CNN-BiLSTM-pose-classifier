@@ -29,11 +29,7 @@ LOG.setLevel(logging.INFO)
 
 
 class TTS:
-    """
-    Windows-safe TTS queue.
-    Prefers native SAPI (COM) in a dedicated STA worker thread.
-    Falls back to pyttsx3 if needed.
-    """
+    """Windows-safe TTS queue.Prefers native SAPI (COM) in a dedicated STA worker thread.Falls back to pyttsx3 if needed. """
 
     def __init__(self, prefer_browser: bool = False,rate: int = 175,volume: float = 1.0, voice: str | None = None,beep: bool = True, backend: str = "auto", ):
 
@@ -47,6 +43,17 @@ class TTS:
         self._worker.start()
         LOG.info("TTS worker starting…")
 
+    def set_beep(self, enabled: bool) -> None:
+        self._beep = bool(enabled)
+        LOG.info(f"TTS beep={'on' if self._beep else 'off'}")
+
+    def beep_once(self, freq: int = 1000, dur_ms: int = 80) -> None:
+        if winsound is not None:
+            try:
+                winsound.Beep(freq, dur_ms)
+            except Exception:
+                pass
+
     def _map_wpm_to_sapi_rate(self, wpm: int) -> int:
         return max(-10, min(10, int(round((wpm - 175) / 25))))
 
@@ -56,7 +63,6 @@ class TTS:
             raise RuntimeError("SAPI COM not available")
         pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
         voice = win32client.Dispatch("SAPI.SpVoice")
-
         try:
             tokens = voice.GetVoices()
             names = []
@@ -130,7 +136,6 @@ class TTS:
                         winsound.Beep(1000, 80)
                     except Exception:
                         pass
-
                 try:
                     LOG.info(f"tts_start  | {text}")
                     if backend == "sapi":
