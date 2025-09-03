@@ -11,10 +11,13 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfigurati
 import torch
 import mediapipe as mp
 
-
 from tip_aggregator import TipAggregator
 if "tip_agg" not in st.session_state:
     st.session_state.tip_agg = TipAggregator()
+if "last_summary_text" not in st.session_state:
+    st.session_state.last_summary_text = ""
+if "last_summary_ts" not in st.session_state:
+    st.session_state.last_summary_ts = 0.0
 
 from tts import TTS
 try:
@@ -64,9 +67,12 @@ QUALITY_COVERAGE_MIN = 0.60
 MOV_RECORD_THRESH = 0.25
 SPEAK_COOLDOWN = 2.0
 VIS_THRESH = 0.5
-REST_SECS = 15.0
-ACTIVE_MOV_TH = 0.18
+REST_SECS = 15.0                 
+ACTIVE_MOV_TH = 0.18            
+REST_MOV_TH = 0.12              
 SUMMARY_COOLDOWN_S = 10.0
+AGG_DEDUP_S = 1.0               
+
 POSE_LM = mp.solutions.pose.PoseLandmark
 
 ANGLE_SPECS = {
@@ -203,6 +209,29 @@ def _vec_from_feats(frame_feats, feat_cols, mu_by_index, uncomputable_bases):
 
 INFER_SEQ_LEN_DEFAULT = max(40, min(ENGINE["seq_len"], 64))
 
+REPHRASE = {
+    "Set feet ~shoulder-width apart": "set a shoulder-width stance",
+    "Keep chest up (neutral spine)": "keep your chest up and maintain a neutral spine",
+    "Go deeper (hips to at least parallel)": "aim to reach at least parallel depth",
+    "Control the descent": "control the lowering phase",
+    "Drive up": "drive up powerfully out of the bottom",
+
+    "Get hands fully overhead each rep": "fully extend your arms overhead each rep",
+    "Jump wider with your feet": "jump a bit wider with your feet",
+    "Keep a steady rhythm": "keep a steady, consistent rhythm",
+
+    "Keep body in one line (brace core)": "keep your body in one line by bracing your core",
+    "Lower hips—avoid piking": "avoid piking—keep your hips level",
+    "Go deeper—bend elbows more at the bottom": "add a little more depth by bending the elbows further",
+    "Press up strong": "press up strongly to lockout",
+
+    "Keep your body in one line (reduce swing)": "reduce swing and keep a straight body line",
+    "Pull higher—aim chest toward the bar": "pull a bit higher—think chest to bar",
+    "Pull smoothly to the top": "pull smoothly to the top position",
+
+    "Sit tall (avoid rounding the back)": "sit tall and avoid rounding",
+    "Rotate shoulders more side-to-side": "rotate your shoulders more side to side",}
+
 class OverlayProcessor(VideoProcessorBase):
     def __init__(self, selected, speak=False, speak_gate=DEFAULT_SPEAK_GATE, show_debug=False,
                  speak_fn=None, infer_seq_len=INFER_SEQ_LEN_DEFAULT, smooth_k=SMOOTH_K_DEFAULT):
@@ -230,27 +259,57 @@ class OverlayProcessor(VideoProcessorBase):
         self.frame_i = 0
         self.squat_pd = SquatPhaseDetector() if SquatPhaseDetector else None
         self.jacks_pd = JacksPhaseDetector() if JacksPhaseDetector else None
+
+    
         self.agg = TipAggregator()
+        self._agg_last_time = {}        
         self.last_active_ts = time.time()
+        self.idle_started_ts = None
         self.last_summary_ts = 0.0
 
     @property
     def tips_this_set(self):
         return self.agg.total
 
-    def make_summary(self, k=3, min_count=2):
-        return self.agg.summarize(k=k, min_count=min_count)
+    def compose_humane_summary(self, k=2, min_count=2):
+        if not self.agg.counts:
+            return "Nice work—no major corrections this set."
+        ex_counts = defaultdict(int)
+        for (ex, tip), c in self.agg.counts.items():
+            ex_counts[ex] += c
+        exercise = max(ex_counts.items(), key=lambda kv: kv[1])[0]
+        items = sorted(self.agg.counts.items(), key=lambda kv: (kv[1], self.agg.last_ts[kv[0]]), reverse=True)
+        phrases = []
+        for (ex, tip), cnt in items:
+            if ex != exercise: 
+                continue
+            if cnt < min_count and len(phrases) >= k:
+                continue
+            phrase = REPHRASE.get(tip, tip.lower())
+            phrases.append(phrase)
+            if len(phrases) >= k:
+                break
+        if not phrases:
+            phrases = [REPHRASE.get(items[0][0][1], items[0][0][1].lower())]
+        friendly_ex = exercise.capitalize()
+        return f"Here's some feedback from this set of {friendly_ex}: " + "; ".join(phrases) + "."
+
+    def make_summary(self, k=2, min_count=2):
+        return self.compose_humane_summary(k=k, min_count=min_count)
 
     def clear_tips(self):
         self.agg.clear()
+        self._agg_last_time.clear()
 
-    def speak_summary(self, k=3, min_count=2):
+    def speak_summary(self, k=2, min_count=2):
         if not self.speak:
             return None
         summary = self.make_summary(k=k, min_count=min_count)
         if summary:
             self.speak_fn(summary)
             self.last_summary_ts = time.time()
+            st.session_state.last_summary_text = summary
+            st.session_state.last_summary_ts = self.last_summary_ts
             self.clear_tips()
             LOG(f"speak_summary | {summary}")
         return summary
@@ -316,8 +375,6 @@ class OverlayProcessor(VideoProcessorBase):
                     feats_raw["trunk_tilt"] = _trunk_tilt_deg(lm)
                 elif base in ANGLE_SPECS:
                     A, B, C = ANGLE_SPECS[base]; feats_raw[base] = _safe_joint_angle(lm, A, B, C)
-                if base.endswith("_x"):
-                    pass
         for b in REQUIRED_BASE:
             feats_raw.setdefault(b, np.nan)
 
@@ -340,6 +397,11 @@ class OverlayProcessor(VideoProcessorBase):
         now = time.time()
         if self._mov_score >= ACTIVE_MOV_TH:
             self.last_active_ts = now
+        if (self._mov_score < REST_MOV_TH) and (self._coverage >= 0.5):
+            if self.idle_started_ts is None:
+                self.idle_started_ts = now
+        else:
+            self.idle_started_ts = None
 
         if not self.ready:
             if (WARMUP_PAD and len(self.feat_hist) >= self.prob_hist.maxlen) or (len(self.feat_hist) >= 12):
@@ -420,12 +482,16 @@ class OverlayProcessor(VideoProcessorBase):
                     self._speak_if_ok(self.last_tip)
                 elif (now - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and (self._coverage >= 0.5) and (self._mov_score > 0.4):
                     self._speak_if_ok("Keep going", ignore_conf=True)
-
             if self.last_tip:
-                self.agg.add(self.last_label, self.last_tip)
-            if (self.agg.total > 0) and ((now - self.last_active_ts) >= REST_SECS) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
-                if self.speak:
-                    self.speak_summary(k=3, min_count=2)
+                key = (self.last_label.lower(), self.last_tip.strip())
+                last_t = self._agg_last_time.get(key, 0.0)
+                if (now - last_t) >= AGG_DEDUP_S:
+                    self.agg.add(self.last_label, self.last_tip)
+                    self._agg_last_time[key] = now
+            if (self.agg.total > 0) and (self.idle_started_ts is not None):
+                if ((now - self.idle_started_ts) >= REST_SECS) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
+                    if self.speak:
+                        self.speak_summary(k=3, min_count=2)
 
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
         else:
@@ -458,7 +524,7 @@ st.title("PoseCoachAI — Real-time Coach")
 
 @st.cache_resource(show_spinner=False)
 def get_tts(cache_buster: int = 7):
-    return TTS(prefer_browser=False, rate=165, volume=1.0, beep=False)
+    return TTS(prefer_browser=False, rate=170, volume=1.0, beep=False)
 
 tts = get_tts()
 
@@ -495,9 +561,21 @@ toolbar = st.container()
 with toolbar:
     c1, c2, c3 = st.columns([2, 2, 6])
     with c1:
-        end_clicked = st.button("End set", type="primary", use_container_width=True)
+        end_clicked = st.button("End set ▶ Speak summary", type="primary", use_container_width=True)
     with c2:
         tips_count_placeholder = st.empty()
+    with c3:
+        if st.session_state.last_summary_text:
+            ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(st.session_state.last_summary_ts or time.time()))
+            st.download_button(
+                "Download last summary",
+                data=st.session_state.last_summary_text,
+                file_name=f"posecoach_set_{ts}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+        else:
+            st.button("Download last summary", disabled=True, use_container_width=True)
 
 ctx = webrtc_streamer(
     key="posecoach",
@@ -528,7 +606,4 @@ if ctx.video_processor is not None:
         else:
             (st.toast if hasattr(st, "toast") else st.info)("No tips collected this set.")
 
-
 tts.render()
-
-
