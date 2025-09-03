@@ -67,9 +67,11 @@ QUALITY_COVERAGE_MIN = 0.60
 MOV_RECORD_THRESH = 0.25
 SPEAK_COOLDOWN = 2.0
 VIS_THRESH = 0.5
-REST_SECS = 15.0                 
-ACTIVE_MOV_TH = 0.18            
-REST_MOV_TH = 0.12              
+
+REST_SECS = 15.0             
+NOPOSE_REST_SECS = 15.0         
+ACTIVE_MOV_TH = 0.18             
+REST_MOV_TH = 0.12               
 SUMMARY_COOLDOWN_S = 10.0
 AGG_DEDUP_S = 1.0               
 
@@ -178,7 +180,7 @@ def load_engine():
         "sd": sd,
         "feat_cols": list(map(str, feat_cols)),
         "type_names": list(map(str, type_names)),
-        "seq_len": int(seq_len) }
+        "seq_len": int(seq_len)}
 
 ENGINE = load_engine()
 LOG("Logging initialized")
@@ -256,14 +258,15 @@ class OverlayProcessor(VideoProcessorBase):
         self.coach = FormCoach()
         self._last_status = None
         self.speak_fn = speak_fn or (lambda _txt: None)
+
         self.frame_i = 0
         self.squat_pd = SquatPhaseDetector() if SquatPhaseDetector else None
         self.jacks_pd = JacksPhaseDetector() if JacksPhaseDetector else None
 
-    
         self.agg = TipAggregator()
-        self._agg_last_time = {}        
+        self._agg_last_time = {}         
         self.last_active_ts = time.time()
+        self.last_pose_ts = time.time()
         self.idle_started_ts = None
         self.last_summary_ts = 0.0
 
@@ -281,7 +284,7 @@ class OverlayProcessor(VideoProcessorBase):
         items = sorted(self.agg.counts.items(), key=lambda kv: (kv[1], self.agg.last_ts[kv[0]]), reverse=True)
         phrases = []
         for (ex, tip), cnt in items:
-            if ex != exercise: 
+            if ex != exercise:
                 continue
             if cnt < min_count and len(phrases) >= k:
                 continue
@@ -289,7 +292,7 @@ class OverlayProcessor(VideoProcessorBase):
             phrases.append(phrase)
             if len(phrases) >= k:
                 break
-        if not phrases:
+        if not phrases and items:
             phrases = [REPHRASE.get(items[0][0][1], items[0][0][1].lower())]
         friendly_ex = exercise.capitalize()
         return f"Here's some feedback from this set of {friendly_ex}: " + "; ".join(phrases) + "."
@@ -397,7 +400,9 @@ class OverlayProcessor(VideoProcessorBase):
         now = time.time()
         if self._mov_score >= ACTIVE_MOV_TH:
             self.last_active_ts = now
-        if (self._mov_score < REST_MOV_TH) and (self._coverage >= 0.5):
+        if has_pose and (self._coverage >= 0.40):
+            self.last_pose_ts = now
+        if (self._mov_score < REST_MOV_TH) or (self._coverage < 0.30) or (not has_pose):
             if self.idle_started_ts is None:
                 self.idle_started_ts = now
         else:
@@ -488,10 +493,6 @@ class OverlayProcessor(VideoProcessorBase):
                 if (now - last_t) >= AGG_DEDUP_S:
                     self.agg.add(self.last_label, self.last_tip)
                     self._agg_last_time[key] = now
-            if (self.agg.total > 0) and (self.idle_started_ts is not None):
-                if ((now - self.idle_started_ts) >= REST_SECS) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
-                    if self.speak:
-                        self.speak_summary(k=3, min_count=2)
 
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
         else:
@@ -510,7 +511,7 @@ class OverlayProcessor(VideoProcessorBase):
         cv2.putText(img, f"pred: {self.selected}  conf: {conf_txt}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2); y += 22
         fps = 1.0 / max(1e-6, (time.time() - getattr(self, "_t_prev", time.time()))) if fps is None else fps
         cv2.putText(img, f"fps: {fps:.1f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2); y += 22
-        if self.show_debug and avg_probs is not None:
+        if self.show_debug and 'avg_probs' in locals() and avg_probs is not None:
             top3_idx = avg_probs.argsort()[-3:][::-1]
             debug_top3 = " | ".join(f"{ENGINE['type_names'][i]}:{avg_probs[i]*100:.0f}%" for i in top3_idx)
             cv2.putText(img, f"top3: {debug_top3}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2); y += 22
@@ -518,6 +519,12 @@ class OverlayProcessor(VideoProcessorBase):
             cv2.putText(img, f"neutralized: {int(self._neut_frac*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2); y += 22
             cv2.putText(img, f"coverage: {int(self._coverage*100)}%  lower: {int(self._lower_cov*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2); y += 22
             cv2.putText(img, f"motion:{self._mov_score:.2f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 200, 180), 2); y += 22
+        if self.speak and (self.agg.total > 0):
+            idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
+            nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
+            if (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
+                self.speak_summary(k=3, min_count=2)
+
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 st.title("PoseCoachAI — Real-time Coach")
@@ -572,8 +579,7 @@ with toolbar:
                 data=st.session_state.last_summary_text,
                 file_name=f"posecoach_set_{ts}.txt",
                 mime="text/plain",
-                use_container_width=True,
-            )
+                use_container_width=True, )
         else:
             st.button("Download last summary", disabled=True, use_container_width=True)
 
@@ -588,7 +594,7 @@ ctx = webrtc_streamer(
         show_debug=show_debug,
         speak_fn=tts.say,
         infer_seq_len=INFER_SEQ_LEN_DEFAULT,
-        smooth_k=SMOOTH_K_DEFAULT,),
+        smooth_k=SMOOTH_K_DEFAULT, ),
     rtc_configuration=RTC_CONFIGURATION,)
 
 if ctx.video_processor is not None:
@@ -597,13 +603,17 @@ if ctx.video_processor is not None:
     vp.set_speak(speak_enabled, gate=speak_gate)
     vp.set_debug(show_debug)
     vp.speak_fn = tts.say
+
     tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
 
     if end_clicked:
-        summary = vp.speak_summary(k=3, min_count=2)  
+        summary = vp.speak_summary(k=3, min_count=2)
         if summary:
             (st.toast if hasattr(st, "toast") else st.info)("Speaking set summary…")
         else:
             (st.toast if hasattr(st, "toast") else st.info)("No tips collected this set.")
 
+
 tts.render()
+
+
