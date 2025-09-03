@@ -11,6 +11,11 @@ from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfigurati
 import torch
 import mediapipe as mp
 
+
+from tip_aggregator import TipAggregator
+if "tip_agg" not in st.session_state:
+    st.session_state.tip_agg = TipAggregator()
+
 from tts import TTS
 try:
     from phase_detectors import SquatPhaseDetector, JacksPhaseDetector
@@ -59,6 +64,9 @@ QUALITY_COVERAGE_MIN = 0.60
 MOV_RECORD_THRESH = 0.25
 SPEAK_COOLDOWN = 2.0
 VIS_THRESH = 0.5
+REST_SECS = 15.0
+ACTIVE_MOV_TH = 0.18
+SUMMARY_COOLDOWN_S = 10.0
 POSE_LM = mp.solutions.pose.PoseLandmark
 
 ANGLE_SPECS = {
@@ -76,7 +84,8 @@ REQUIRED_JOINTS = {
     "squats": ["LEFT_HIP","RIGHT_HIP","LEFT_KNEE","RIGHT_KNEE","LEFT_ANKLE","RIGHT_ANKLE"],
     "russian twists": ["LEFT_SHOULDER","RIGHT_SHOULDER","LEFT_HIP","RIGHT_HIP"],
     "russian twist": ["LEFT_SHOULDER","RIGHT_SHOULDER","LEFT_HIP","RIGHT_HIP"],
-    "jumping jacks": ["LEFT_HIP","RIGHT_HIP","LEFT_KNEE","RIGHT_KNEE","LEFT_SHOULDER","RIGHT_SHOULDER"],}
+    "jumping jacks": ["LEFT_HIP","RIGHT_HIP","LEFT_KNEE","RIGHT_KNEE","LEFT_SHOULDER","RIGHT_SHOULDER"],
+    "pull ups": ["LEFT_SHOULDER","RIGHT_SHOULDER","LEFT_ELBOW","RIGHT_ELBOW","LEFT_HIP","RIGHT_HIP"],}
 
 def _get_xyzv(lm, name):
     idx = getattr(POSE_LM, name); pt = lm[idx]
@@ -163,7 +172,7 @@ def load_engine():
         "sd": sd,
         "feat_cols": list(map(str, feat_cols)),
         "type_names": list(map(str, type_names)),
-        "seq_len": int(seq_len)}
+        "seq_len": int(seq_len) }
 
 ENGINE = load_engine()
 LOG("Logging initialized")
@@ -195,7 +204,8 @@ def _vec_from_feats(frame_feats, feat_cols, mu_by_index, uncomputable_bases):
 INFER_SEQ_LEN_DEFAULT = max(40, min(ENGINE["seq_len"], 64))
 
 class OverlayProcessor(VideoProcessorBase):
-    def __init__(self, selected, speak=False, speak_gate=DEFAULT_SPEAK_GATE, show_debug=False,speak_fn=None, infer_seq_len=INFER_SEQ_LEN_DEFAULT, smooth_k=SMOOTH_K_DEFAULT):
+    def __init__(self, selected, speak=False, speak_gate=DEFAULT_SPEAK_GATE, show_debug=False,
+                 speak_fn=None, infer_seq_len=INFER_SEQ_LEN_DEFAULT, smooth_k=SMOOTH_K_DEFAULT):
         self.selected = selected
         self.show_debug = show_debug
         self.pose = mp.solutions.pose.Pose(model_complexity=0, min_detection_confidence=0.5, min_tracking_confidence=0.5)
@@ -217,10 +227,33 @@ class OverlayProcessor(VideoProcessorBase):
         self.coach = FormCoach()
         self._last_status = None
         self.speak_fn = speak_fn or (lambda _txt: None)
-
         self.frame_i = 0
         self.squat_pd = SquatPhaseDetector() if SquatPhaseDetector else None
         self.jacks_pd = JacksPhaseDetector() if JacksPhaseDetector else None
+        self.agg = TipAggregator()
+        self.last_active_ts = time.time()
+        self.last_summary_ts = 0.0
+
+    @property
+    def tips_this_set(self):
+        return self.agg.total
+
+    def make_summary(self, k=3, min_count=2):
+        return self.agg.summarize(k=k, min_count=min_count)
+
+    def clear_tips(self):
+        self.agg.clear()
+
+    def speak_summary(self, k=3, min_count=2):
+        if not self.speak:
+            return None
+        summary = self.make_summary(k=k, min_count=min_count)
+        if summary:
+            self.speak_fn(summary)
+            self.last_summary_ts = time.time()
+            self.clear_tips()
+            LOG(f"speak_summary | {summary}")
+        return summary
 
     def set_selected(self, s):
         self.selected = s
@@ -283,6 +316,8 @@ class OverlayProcessor(VideoProcessorBase):
                     feats_raw["trunk_tilt"] = _trunk_tilt_deg(lm)
                 elif base in ANGLE_SPECS:
                     A, B, C = ANGLE_SPECS[base]; feats_raw[base] = _safe_joint_angle(lm, A, B, C)
+                if base.endswith("_x"):
+                    pass
         for b in REQUIRED_BASE:
             feats_raw.setdefault(b, np.nan)
 
@@ -301,6 +336,11 @@ class OverlayProcessor(VideoProcessorBase):
             self._mov_score = float(np.mean(np.abs(recent)))
         else:
             self._mov_score = 0.0
+
+        now = time.time()
+        if self._mov_score >= ACTIVE_MOV_TH:
+            self.last_active_ts = now
+
         if not self.ready:
             if (WARMUP_PAD and len(self.feat_hist) >= self.prob_hist.maxlen) or (len(self.feat_hist) >= 12):
                 self.ready = True
@@ -371,7 +411,6 @@ class OverlayProcessor(VideoProcessorBase):
             LOG(f"pred={self.last_label} conf={self.last_conf:.3f} mov={self._mov_score:.2f} "
                 f"cov={self._coverage:.2f} neut={self._neut_frac:.2f} status={self.status}")
 
-            now = time.time()
             if self.speak:
                 if (not self._announced_ready) and (self.last_conf >= self.speak_gate) and (self._coverage >= 0.5):
                     self.speak_fn(f"{self.last_label} ready")
@@ -381,6 +420,12 @@ class OverlayProcessor(VideoProcessorBase):
                     self._speak_if_ok(self.last_tip)
                 elif (now - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and (self._coverage >= 0.5) and (self._mov_score > 0.4):
                     self._speak_if_ok("Keep going", ignore_conf=True)
+
+            if self.last_tip:
+                self.agg.add(self.last_label, self.last_tip)
+            if (self.agg.total > 0) and ((now - self.last_active_ts) >= REST_SECS) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
+                if self.speak:
+                    self.speak_summary(k=3, min_count=2)
 
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
         else:
@@ -426,14 +471,13 @@ with cols_test[1]:
     try:
         tts.set_beep(beep_debug)
     except AttributeError:
-        pass  
+        pass
 with cols_test[2]:
     if st.button("Beep test only", key="beep_test_only"):
         try:
             tts.beep_once()
         except AttributeError:
             pass
-
 LOG("tts_backend=server")
 
 col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
@@ -445,6 +489,15 @@ with col3:
     speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05, key="speak_gate_slider")
 with col4:
     show_debug = st.toggle("Debug overlays", value=False, key="debug_overlay_toggle")
+
+st.markdown("### Session Controls")
+toolbar = st.container()
+with toolbar:
+    c1, c2, c3 = st.columns([2, 2, 6])
+    with c1:
+        end_clicked = st.button("End set", type="primary", use_container_width=True)
+    with c2:
+        tips_count_placeholder = st.empty()
 
 ctx = webrtc_streamer(
     key="posecoach",
@@ -461,9 +514,21 @@ ctx = webrtc_streamer(
     rtc_configuration=RTC_CONFIGURATION,)
 
 if ctx.video_processor is not None:
-    ctx.video_processor.set_selected(selected_ex)
-    ctx.video_processor.set_speak(speak_enabled, gate=speak_gate)
-    ctx.video_processor.set_debug(show_debug)
-    ctx.video_processor.speak_fn = tts.say
+    vp = ctx.video_processor
+    vp.set_selected(selected_ex)
+    vp.set_speak(speak_enabled, gate=speak_gate)
+    vp.set_debug(show_debug)
+    vp.speak_fn = tts.say
+    tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
+
+    if end_clicked:
+        summary = vp.speak_summary(k=3, min_count=2)  
+        if summary:
+            (st.toast if hasattr(st, "toast") else st.info)("Speaking set summary…")
+        else:
+            (st.toast if hasattr(st, "toast") else st.info)("No tips collected this set.")
+
 
 tts.render()
+
+
