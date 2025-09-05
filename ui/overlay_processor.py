@@ -1,17 +1,17 @@
 import time
+import json
 import logging
+from pathlib import Path
 from collections import deque, defaultdict
 import numpy as np
 import torch
 import av
 import cv2
 import mediapipe as mp
-import streamlit as st
 from streamlit_webrtc import VideoProcessorBase
 
 from posecoach.coaching.tip_aggregator import TipAggregator
 from posecoach.coaching.coaching_rules import FormCoach
-
 try:
     from posecoach.coaching.coaching_rules import tips_from_phase_events
 except Exception:
@@ -27,7 +27,6 @@ from posecoach.vision.pose_utils import (
 from posecoach.coaching.summary import compose_humane_summary
 
 LOGGER = logging.getLogger("posecoach")
-
 SMOOTH_K_DEFAULT = 6
 WARMUP_PAD = True
 DEFAULT_SPEAK_GATE = 0.30
@@ -35,13 +34,14 @@ QUALITY_NEUTRALIZE_MAX = 0.35
 QUALITY_COVERAGE_MIN = 0.60
 MOV_RECORD_THRESH = 0.25
 SPEAK_COOLDOWN = 2.0
-
 REST_SECS = 15.0
 NOPOSE_REST_SECS = 15.0
 ACTIVE_MOV_TH = 0.18
 REST_MOV_TH = 0.12
 SUMMARY_COOLDOWN_S = 10.0
 AGG_DEDUP_S = 1.0
+ROOT = Path(__file__).resolve().parents[1]
+SUMMARY_PATH = ROOT / "outputs" / "session_logs" / "last_summary.json"
 
 def _base_of(n: str) -> str:
     if n.endswith("_diff"): return n[:-5]
@@ -61,6 +61,14 @@ def _vec_from_feats(frame_feats, feat_cols, mu_by_index, uncomputable_bases):
             v[i] = float(x)
     return v, neutralized / max(1, len(feat_cols))
 
+def _persist_summary(text: str, ts: float):
+    try:
+        SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(SUMMARY_PATH, "w", encoding="utf-8") as f:
+            json.dump({"text": text, "ts": ts}, f)
+    except Exception as e:
+        LOGGER.warning(f"summary_persist_fail: {e}")
+
 class OnlineFeatureBuilder:
     def __init__(self, base_names, ma_window=5):
         self.base = list(base_names)
@@ -79,6 +87,9 @@ class OnlineFeatureBuilder:
         return out
 
 class OverlayProcessor(VideoProcessorBase):
+    """
+    NOTE: This class must not call Streamlit APIs. The UI thread polls it.
+    """
     def __init__(self, engine, selected, speak=False, speak_gate=DEFAULT_SPEAK_GATE, show_debug=False,
                  speak_fn=None, infer_seq_len=None, smooth_k=SMOOTH_K_DEFAULT):
         self.engine = engine
@@ -108,11 +119,12 @@ class OverlayProcessor(VideoProcessorBase):
         self.squat_pd = SquatPhaseDetector() if SquatPhaseDetector else None
         self.jacks_pd = JacksPhaseDetector() if JacksPhaseDetector else None
         self.agg = TipAggregator()
-        self._agg_last_time = {}        
+        self._agg_last_time = {}         
         self.last_active_ts = time.time()
         self.last_pose_ts = time.time()
         self.idle_started_ts = None
         self.last_summary_ts = 0.0
+        self._last_summary_payload = None  
         self._feat_cols = self.engine["feat_cols"]
         self._mu = self.engine["mu"]
         self._sd = self.engine["sd"]
@@ -145,14 +157,20 @@ class OverlayProcessor(VideoProcessorBase):
         if not self.speak: return None
         summary = self._compose_summary(k=k, min_count=min_count)
         if summary:
+            ts = time.time()
+            self.last_summary_ts = ts
+            self._last_summary_payload = {"text": summary, "ts": ts}
+            _persist_summary(summary, ts)
             self.speak_fn(summary)
-            self.last_summary_ts = time.time()
-            st.session_state.last_summary_text = summary
-            st.session_state.last_summary_ts = self.last_summary_ts
             self.agg.clear(); self._agg_last_time.clear()
             LOGGER.info(f"speak_summary | {summary}")
         return summary
 
+    def consume_summary_payload(self):
+        """UI thread calls this to receive the latest summary (once)."""
+        p, self._last_summary_payload = self._last_summary_payload, None
+        return p
+    
     def _record_tip_heard(self, tip: str):
         key = (self.last_label.lower(), (tip or "").strip())
         last_t = self._agg_last_time.get(key, 0.0)
@@ -293,16 +311,15 @@ class OverlayProcessor(VideoProcessorBase):
                     la = float(self.last_raw.get("left_shoulder_abd", 90) or 90)
                     ra = float(self.last_raw.get("right_shoulder_abd", 90) or 90)
                     if min(la, ra) < 60: tip = "Raise arms higher"
-
             self._last_tip = tip if self.last_label != "unknown" else None
             if self.speak:
                 if (not self._announced_ready) and (self.last_conf >= self.speak_gate) and (self._coverage >= 0.5):
                     self.speak_fn(f"{self.last_label} ready")
                     self._announced_ready = True
-                    self._last_tip_t = now
-                if self._last_tip and (now - self._last_tip_t > SPEAK_COOLDOWN) and (self._coverage >= 0.5):
+                    self._last_tip_t = time.time()
+                if self._last_tip and (time.time() - self._last_tip_t > SPEAK_COOLDOWN) and (self._coverage >= 0.5):
                     self._speak_if_ok(self._last_tip)
-                elif (now - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and (self._coverage >= 0.5) and (self._mov_score > 0.4):
+                elif (time.time() - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and (self._coverage >= 0.5) and (self._mov_score > 0.4):
                     self._speak_if_ok("Keep going", ignore_conf=True)
 
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
@@ -314,6 +331,7 @@ class OverlayProcessor(VideoProcessorBase):
                 self._last_status = self.status
             self.last_conf = 0.0
             avg_probs = None
+
         y = 22
         color_status = (0, 165, 255) if self.status in ("no_pose", "need_full_body", "low_quality", "warming", "idle") else (255, 255, 255)
         cv2.putText(img, f"status: {self.status}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_status, 2); y += 22
@@ -328,15 +346,16 @@ class OverlayProcessor(VideoProcessorBase):
         if self.show_debug:
             cv2.putText(img, f"neutralized: {int(self._neut_frac*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2); y += 22
             cv2.putText(img, f"coverage: {int(self._coverage*100)}%  lower: {int(self._lower_cov*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2); y += 22
-            cv2.putText(img, f"motion:{self._mov_score:.2f}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 200, 180), 2); y += 22
-
+        try:
+            h, w = img.shape[:2]
+            cv2.putText(img, f"tips: {self.agg.total}", (w - 160, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+        except Exception:
+            pass
         if self.speak and (self.agg.total > 0):
-            idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
-            nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
-            if (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
+            idle_ok = (self.idle_started_ts is not None) and ((time.time() - self.idle_started_ts) >= REST_SECS)
+            nopose_ok = (time.time() - self.last_pose_ts) >= NOPOSE_REST_SECS
+            if (idle_ok or nopose_ok) and ((time.time() - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
                 self.speak_summary(k=3, min_count=2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
-    
-
-
