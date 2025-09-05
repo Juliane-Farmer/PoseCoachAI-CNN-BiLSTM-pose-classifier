@@ -1,4 +1,5 @@
 import time
+import json
 import sys
 from pathlib import Path
 import streamlit as st
@@ -14,12 +15,24 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+SUMMARY_PATH = Path(__file__).resolve().parents[1] / "outputs" / "session_logs" / "last_summary.json"
+
+
+def _read_summary_file():
+    try:
+        if SUMMARY_PATH.exists():
+            with open(SUMMARY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data
+    except Exception:
+        pass
+    return None
+
 ss = st.session_state
 ss.setdefault("camera_paused", False)
 ss.setdefault("last_summary_text", "")
 ss.setdefault("last_summary_ts", 0.0)
-ss.setdefault("last_summary_ts_seen", 0.0)
-ss.setdefault("auto_pause_on_summary", True)
+ss.setdefault("auto_pause_on_summary", True)  
 
 def rerun():
     try: st.rerun()
@@ -36,8 +49,29 @@ def get_tts(cache_buster: int = 1):
 ENGINE = get_engine()
 tts = get_tts()
 
+_tick_enabled = False
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=2000, key="posecoach_tick")  
+    _tick_enabled = True
+except Exception:
+    pass
+
+if not _tick_enabled:
+    st.markdown(
+        """
+        <script>
+        // Minimal rerun loop when `streamlit-autorefresh` is not installed.
+        if (!window._posecoach_tick) {
+          window._posecoach_tick = setInterval(function() {
+            window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:rerun" }, "*");
+          }, 2000);
+        }
+        </script>
+        """,
+        unsafe_allow_html=True, )
+
 st.title("PoseCoachAI — Real-time Coach")
-st.caption("UI build: v2025-09-05-01")
 
 c1, c2, c3 = st.columns([2, 1, 1])
 with c1:
@@ -46,7 +80,6 @@ with c2:
     speak_enabled = st.toggle("Voice tips", value=True)
 with c3:
     speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05)
-
 with st.sidebar:
     st.subheader("Debug & Utilities")
     if st.button("Speak test"):
@@ -75,7 +108,7 @@ with t3:
             data=ss.last_summary_text,
             file_name=f"posecoach_set_{ts}.txt",
             mime="text/plain",
-            use_container_width=True, )
+            use_container_width=True,)
     else:
         st.button("Download last summary", disabled=True, use_container_width=True)
 
@@ -93,8 +126,9 @@ if not ss.camera_paused:
             speak=speak_enabled,
             speak_gate=speak_gate,
             show_debug=show_debug,
-            speak_fn=tts.say,),
-        rtc_configuration=RTC_CONFIGURATION,)
+            speak_fn=tts.say, ),
+        rtc_configuration=RTC_CONFIGURATION,
+        async_processing=True,  )
 
     if ctx.video_processor is not None:
         vp = ctx.video_processor
@@ -102,21 +136,40 @@ if not ss.camera_paused:
         vp.set_speak(speak_enabled, gate=speak_gate)
         vp.set_debug(show_debug)
         vp.speak_fn = tts.say
+
         tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
         if end_clicked:
-            summary = vp.speak_summary(k=3, min_count=2)
-            if summary:
-                (st.toast if hasattr(st, "toast") else st.info)("Speaking set summary…")
-                vp.reset_set()
-                tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
+            if time.time() - ss.last_summary_ts < 5:
+                (st.toast if hasattr(st, "toast") else st.info)("Summary just delivered.")
+            else:
+                summary = vp.speak_summary(k=3, min_count=2)
+                if summary:
+                    ss.last_summary_text = summary
+                    ss.last_summary_ts = time.time()
+                    (st.toast if hasattr(st, "toast") else st.info)("Speaking set summary…")
+                    vp.reset_set()
+                    tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
+                    ss.camera_paused = True
+                    try: ctx.stop()
+                    except Exception: pass
+                    rerun()
+                else:
+                    (st.toast if hasattr(st, "toast") else st.info)("No tips collected this set.")
+        payload = vp.consume_summary_payload()
+        if payload:
+            ss.last_summary_text = payload["text"]
+            ss.last_summary_ts = payload["ts"]
+            vp.reset_set()
+            tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
+            if ss.auto_pause_on_summary:
                 ss.camera_paused = True
                 try: ctx.stop()
                 except Exception: pass
                 rerun()
-            else:
-                (st.toast if hasattr(st, "toast") else st.info)("No tips collected this set.")
-        if ss.last_summary_ts > ss.last_summary_ts_seen:
-            ss.last_summary_ts_seen = ss.last_summary_ts
+        file_data = _read_summary_file()
+        if file_data and float(file_data.get("ts", 0.0)) > float(ss.last_summary_ts or 0.0):
+            ss.last_summary_text = str(file_data.get("text", "") or "")
+            ss.last_summary_ts = float(file_data.get("ts", time.time()))
             vp.reset_set()
             tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
             if ss.auto_pause_on_summary:
@@ -131,4 +184,3 @@ else:
         rerun()
 
 tts.render()
-
