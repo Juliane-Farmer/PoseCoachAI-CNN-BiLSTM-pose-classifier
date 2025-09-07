@@ -25,6 +25,10 @@ def load_engine(root: Path):
         in_feats=in_feats, cnn_channels=256, lstm_hidden=256, lstm_layers=2, dropout=0.5, num_type=int(y_type.max()+1), num_form=None).to(device)
     state = torch.load(model_path, map_location=device)
     model.load_state_dict(state); model.eval()
+    with torch.no_grad():
+        dummy = torch.zeros(1, int(seq_len), in_feats, dtype=torch.float32, device=device)
+        _ = model(dummy)  
+
 
     return {
         "model": model,
