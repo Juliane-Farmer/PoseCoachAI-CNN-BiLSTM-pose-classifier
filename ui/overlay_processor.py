@@ -40,6 +40,7 @@ ACTIVE_MOV_TH = 0.18
 REST_MOV_TH = 0.12
 SUMMARY_COOLDOWN_S = 10.0
 AGG_DEDUP_S = 1.0
+
 ROOT = Path(__file__).resolve().parents[1]
 SUMMARY_PATH = ROOT / "outputs" / "session_logs" / "last_summary.json"
 
@@ -60,14 +61,6 @@ def _vec_from_feats(frame_feats, feat_cols, mu_by_index, uncomputable_bases):
         else:
             v[i] = float(x)
     return v, neutralized / max(1, len(feat_cols))
-
-def _persist_summary(text: str, ts: float):
-    try:
-        SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(SUMMARY_PATH, "w", encoding="utf-8") as f:
-            json.dump({"text": text, "ts": ts}, f)
-    except Exception as e:
-        LOGGER.warning(f"summary_persist_fail: {e}")
 
 class OnlineFeatureBuilder:
     def __init__(self, base_names, ma_window=5):
@@ -119,12 +112,17 @@ class OverlayProcessor(VideoProcessorBase):
         self.squat_pd = SquatPhaseDetector() if SquatPhaseDetector else None
         self.jacks_pd = JacksPhaseDetector() if JacksPhaseDetector else None
         self.agg = TipAggregator()
-        self._agg_last_time = {}         
+        self._agg_last_time = {}
         self.last_active_ts = time.time()
         self.last_pose_ts = time.time()
         self.idle_started_ts = None
         self.last_summary_ts = 0.0
-        self._last_summary_payload = None  
+        self._last_summary_payload = None 
+
+        self._start_ts = time.time()
+        self._warmup_announced = False
+        self._ready_announced = False
+
         self._feat_cols = self.engine["feat_cols"]
         self._mu = self.engine["mu"]
         self._sd = self.engine["sd"]
@@ -139,7 +137,6 @@ class OverlayProcessor(VideoProcessorBase):
         return self.agg.total
 
     def reset_set(self):
-        """Start a fresh set: clear tips + reset timers."""
         self.agg.clear(); self._agg_last_time.clear()
         self.last_active_ts = time.time()
         self.last_pose_ts = time.time()
@@ -160,17 +157,21 @@ class OverlayProcessor(VideoProcessorBase):
             ts = time.time()
             self.last_summary_ts = ts
             self._last_summary_payload = {"text": summary, "ts": ts}
-            _persist_summary(summary, ts)
+            try:
+                SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with open(SUMMARY_PATH, "w", encoding="utf-8") as f:
+                    json.dump({"text": summary, "ts": ts}, f)
+            except Exception as e:
+                LOGGER.warning(f"summary_persist_fail: {e}")
             self.speak_fn(summary)
             self.agg.clear(); self._agg_last_time.clear()
             LOGGER.info(f"speak_summary | {summary}")
         return summary
 
     def consume_summary_payload(self):
-        """UI thread calls this to receive the latest summary (once)."""
         p, self._last_summary_payload = self._last_summary_payload, None
         return p
-    
+
     def _record_tip_heard(self, tip: str):
         key = (self.last_label.lower(), (tip or "").strip())
         last_t = self._agg_last_time.get(key, 0.0)
@@ -233,6 +234,10 @@ class OverlayProcessor(VideoProcessorBase):
         else:
             self._mov_score = 0.0
         now = time.time()
+
+        if (not self._warmup_announced) and self.speak and (now - self._start_ts) > 1.0:
+            self._warmup_announced = True
+            self.speak_fn("Start with a brief warm-up set. Coaching will begin shortly.")
         if self._mov_score >= ACTIVE_MOV_TH:
             self.last_active_ts = now
         if has_pose and (self._coverage >= 0.40):
@@ -242,12 +247,17 @@ class OverlayProcessor(VideoProcessorBase):
                 self.idle_started_ts = now
         else:
             self.idle_started_ts = None
+        just_ready = False
         if not self.ready:
             if (WARMUP_PAD and len(self.feat_hist) >= self.prob_hist.maxlen) or (len(self.feat_hist) >= 12):
                 self.ready = True
+                just_ready = True
                 LOGGER.info("engine | ready")
             else:
                 self.status = "need_full_body" if not enough_pose else "warming"
+        if self.speak and self.ready and (not self._ready_announced) and enough_pose and (self._coverage >= 0.50):
+            self._ready_announced = True
+            self.speak_fn("PoseCoach is ready.")
 
         avg_probs = None
         if self.ready and enough_pose and quality_ok:
@@ -311,15 +321,16 @@ class OverlayProcessor(VideoProcessorBase):
                     la = float(self.last_raw.get("left_shoulder_abd", 90) or 90)
                     ra = float(self.last_raw.get("right_shoulder_abd", 90) or 90)
                     if min(la, ra) < 60: tip = "Raise arms higher"
+
             self._last_tip = tip if self.last_label != "unknown" else None
             if self.speak:
                 if (not self._announced_ready) and (self.last_conf >= self.speak_gate) and (self._coverage >= 0.5):
-                    self.speak_fn(f"{self.last_label} ready")
                     self._announced_ready = True
-                    self._last_tip_t = time.time()
-                if self._last_tip and (time.time() - self._last_tip_t > SPEAK_COOLDOWN) and (self._coverage >= 0.5):
+                    self._last_tip_t = now
+                    self.speak_fn(f"{self.last_label} ready")
+                if self._last_tip and (now - self._last_tip_t > SPEAK_COOLDOWN) and (self._coverage >= 0.5):
                     self._speak_if_ok(self._last_tip)
-                elif (time.time() - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and (self._coverage >= 0.5) and (self._mov_score > 0.4):
+                elif (now - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and (self._coverage >= 0.5) and (self._mov_score > 0.4):
                     self._speak_if_ok("Keep going", ignore_conf=True)
 
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
@@ -353,9 +364,11 @@ class OverlayProcessor(VideoProcessorBase):
         except Exception:
             pass
         if self.speak and (self.agg.total > 0):
-            idle_ok = (self.idle_started_ts is not None) and ((time.time() - self.idle_started_ts) >= REST_SECS)
-            nopose_ok = (time.time() - self.last_pose_ts) >= NOPOSE_REST_SECS
-            if (idle_ok or nopose_ok) and ((time.time() - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
+            idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
+            nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
+            if (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
                 self.speak_summary(k=3, min_count=2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
