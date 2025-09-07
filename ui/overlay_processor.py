@@ -82,20 +82,15 @@ class OnlineFeatureBuilder:
         return out
 
 class OverlayProcessor(VideoProcessorBase):
-    """
-    NOTE: This class must not call Streamlit APIs. The UI thread polls it.
-    """
     def __init__(self, engine, selected, speak=False, speak_gate=DEFAULT_SPEAK_GATE, show_debug=False,
                  speak_fn=None, infer_seq_len=None, smooth_k=SMOOTH_K_DEFAULT):
         self.engine = engine
         self.selected = selected
         self.show_debug = show_debug
         self.pose = mp.solutions.pose.Pose(model_complexity=0, min_detection_confidence=0.5, min_tracking_confidence=0.5)
-
         self.prob_hist = deque(maxlen=int(smooth_k))
         seq = max(40, min(engine["seq_len"], 64)) if infer_seq_len is None else int(infer_seq_len)
         self.feat_hist = deque(maxlen=seq)
-
         self.ready = False
         self.pose_present = deque(maxlen=15)
         self.last_label = "unknown"; self.last_conf = 0.0
@@ -113,18 +108,16 @@ class OverlayProcessor(VideoProcessorBase):
         self.frame_i = 0
         self.squat_pd = SquatPhaseDetector() if SquatPhaseDetector else None
         self.jacks_pd = JacksPhaseDetector() if JacksPhaseDetector else None
-
         self.agg = TipAggregator()
         self._agg_last_time = {}
         self.last_active_ts = time.time()
         self.last_pose_ts = time.time()
         self.idle_started_ts = None
         self.last_summary_ts = 0.0
-        self._last_summary_payload = None  
+        self._last_summary_payload = None
         self._start_ts = time.time()
         self._warmup_announced = False
         self._ready_announced = False
-
         self._feat_cols = self.engine["feat_cols"]
         self._mu = self.engine["mu"]
         self._sd = self.engine["sd"]
@@ -153,7 +146,6 @@ class OverlayProcessor(VideoProcessorBase):
         return compose_humane_summary(self.agg.counts, self.agg.last_ts, k=k, min_count=min_count)
 
     def speak_summary(self, k=2, min_count=2):
-        if not self.speak: return None
         summary = self._compose_summary(k=k, min_count=min_count)
         if summary:
             ts = time.time()
@@ -165,7 +157,11 @@ class OverlayProcessor(VideoProcessorBase):
                     json.dump({"text": summary, "ts": ts}, f)
             except Exception as e:
                 LOGGER.warning(f"summary_persist_fail: {e}")
-            self.speak_fn(summary)
+            try:
+                if self.speak:
+                    self.speak_fn(summary)
+            except Exception:
+                pass
             self.agg.clear(); self._agg_last_time.clear()
             LOGGER.info(f"speak_summary | {summary}")
         return summary
@@ -208,7 +204,6 @@ class OverlayProcessor(VideoProcessorBase):
         all_joints = sorted(set(sum([list(v) for v in REQUIRED_JOINTS.values()], [])))
         self._coverage = (np.mean([(get_xyzv(lm, n)[1] >= VIS_THRESH) for n in all_joints]) if has_pose else 0.0)
         self._lower_cov = (np.mean([(get_xyzv(lm, n)[1] >= VIS_THRESH) for n in REQUIRED_JOINTS["squat"]]) if has_pose else 0.0)
-
         feats_raw = {}
         if has_pose:
             for base in self._required_base:
@@ -216,9 +211,16 @@ class OverlayProcessor(VideoProcessorBase):
                     feats_raw["trunk_tilt"] = trunk_tilt_deg(lm)
                 elif base in ANGLE_SPECS:
                     A, B, C = ANGLE_SPECS[base]; feats_raw[base] = safe_joint_angle(lm, A, B, C)
+            for NM in ("LEFT_ANKLE","RIGHT_ANKLE","LEFT_HIP","RIGHT_HIP"):
+                pt, vis = get_xyzv(lm, NM)
+                nm = NM.lower()
+                feats_raw[f"{nm}_x"] = float(pt[0]) if vis >= VIS_THRESH else np.nan
+            for NM in ("LEFT_WRIST","RIGHT_WRIST"):
+                pt, vis = get_xyzv(lm, NM)
+                nm = NM.lower()
+                feats_raw[f"{nm}_y"] = float(pt[1]) if vis >= VIS_THRESH else np.nan
         for b in self._required_base:
             feats_raw.setdefault(b, np.nan)
-
         if self._builder is None:
             self._builder = OnlineFeatureBuilder(self._required_base, ma_window=5)
         feats = self._builder.push(feats_raw)
@@ -249,11 +251,9 @@ class OverlayProcessor(VideoProcessorBase):
                 self.idle_started_ts = now
         else:
             self.idle_started_ts = None
-        just_ready = False
         if not self.ready:
             if (WARMUP_PAD and len(self.feat_hist) >= self.prob_hist.maxlen) or (len(self.feat_hist) >= 12):
                 self.ready = True
-                just_ready = True
                 LOGGER.info("engine | ready")
             else:
                 self.status = "need_full_body" if not enough_pose else "warming"
@@ -281,14 +281,13 @@ class OverlayProcessor(VideoProcessorBase):
                 self.prob_hist.append(probs)
             avg_probs = np.mean(np.stack(self.prob_hist, axis=0), axis=0) if len(self.prob_hist) else probs
 
-            idx_map = {n.lower(): i for i, n in enumerate(self.engine["type_names"])}
+            idx_map = {n.lower(): i for i, n in enumerate(self.engine["type_names"]) }
             sel_idx = idx_map.get(str(self.selected).strip().lower(), None)
             if sel_idx is not None:
                 self.last_label = self.engine["type_names"][sel_idx]
                 self.last_conf = float(avg_probs[sel_idx])
             else:
                 self.last_label = "unknown"; self.last_conf = 0.0
-
             self.status = "ok"
             tip = self.coach.update(self.last_label, self.last_raw, mov=self._mov_score, coverage=self._coverage)
 
@@ -299,7 +298,7 @@ class OverlayProcessor(VideoProcessorBase):
                     lk = float(self.last_raw.get("left_knee_angle", 180) or 180)
                     rk = float(self.last_raw.get("right_knee_angle", 180) or 180)
                     events += self.squat_pd.update(self.frame_i, min(lk, rk))
-                if self.jacks_pd and ll in ("jumping jacks",):
+                if self.jacks_pd and ll in ("jumping jacks","jumping-jacks","jumpingjack"):
                     la = float(self.last_raw.get("left_shoulder_abd", 0) or 0)
                     ra = float(self.last_raw.get("right_shoulder_abd", 0) or 0)
                     events += self.jacks_pd.update(self.frame_i, max(la, ra))
@@ -323,7 +322,10 @@ class OverlayProcessor(VideoProcessorBase):
                     la = float(self.last_raw.get("left_shoulder_abd", 90) or 90)
                     ra = float(self.last_raw.get("right_shoulder_abd", 90) or 90)
                     if min(la, ra) < 60: tip = "Raise arms higher"
+
             self._last_tip = tip if self.last_label != "unknown" else None
+            if self._last_tip and (self._coverage >= 0.5) and self._last_tip not in ("Keep going", f"{self.last_label} ready"):
+                self._record_tip_heard(self._last_tip)
             if self.speak:
                 if (not self._announced_ready) and (self.last_conf >= self.speak_gate) and (self._coverage >= 0.5):
                     self._announced_ready = True
@@ -333,7 +335,6 @@ class OverlayProcessor(VideoProcessorBase):
                     self._speak_if_ok(self._last_tip)
                 elif (now - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and (self._coverage >= 0.5) and (self._mov_score > 0.4):
                     self._speak_if_ok("Keep going", ignore_conf=True)
-
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
         else:
             self.prob_hist.clear()
@@ -364,7 +365,7 @@ class OverlayProcessor(VideoProcessorBase):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
         except Exception:
             pass
-        if self.speak and (self.agg.total > 0):
+        if self.agg.total > 0:
             idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
             nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
             if (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
