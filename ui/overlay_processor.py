@@ -27,6 +27,7 @@ from posecoach.vision.pose_utils import (
 from posecoach.coaching.summary import compose_humane_summary
 
 LOGGER = logging.getLogger("posecoach")
+
 SMOOTH_K_DEFAULT = 6
 WARMUP_PAD = True
 DEFAULT_SPEAK_GATE = 0.30
@@ -34,6 +35,7 @@ QUALITY_NEUTRALIZE_MAX = 0.35
 QUALITY_COVERAGE_MIN = 0.60
 MOV_RECORD_THRESH = 0.25
 SPEAK_COOLDOWN = 2.0
+
 REST_SECS = 15.0
 NOPOSE_REST_SECS = 15.0
 ACTIVE_MOV_TH = 0.18
@@ -111,14 +113,14 @@ class OverlayProcessor(VideoProcessorBase):
         self.frame_i = 0
         self.squat_pd = SquatPhaseDetector() if SquatPhaseDetector else None
         self.jacks_pd = JacksPhaseDetector() if JacksPhaseDetector else None
+
         self.agg = TipAggregator()
         self._agg_last_time = {}
         self.last_active_ts = time.time()
         self.last_pose_ts = time.time()
         self.idle_started_ts = None
         self.last_summary_ts = 0.0
-        self._last_summary_payload = None 
-
+        self._last_summary_payload = None  
         self._start_ts = time.time()
         self._warmup_announced = False
         self._ready_announced = False
@@ -321,7 +323,6 @@ class OverlayProcessor(VideoProcessorBase):
                     la = float(self.last_raw.get("left_shoulder_abd", 90) or 90)
                     ra = float(self.last_raw.get("right_shoulder_abd", 90) or 90)
                     if min(la, ra) < 60: tip = "Raise arms higher"
-
             self._last_tip = tip if self.last_label != "unknown" else None
             if self.speak:
                 if (not self._announced_ready) and (self.last_conf >= self.speak_gate) and (self._coverage >= 0.5):
@@ -370,5 +371,3 @@ class OverlayProcessor(VideoProcessorBase):
                 self.speak_summary(k=3, min_count=2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-
