@@ -43,9 +43,6 @@ REST_MOV_TH = 0.12
 SUMMARY_COOLDOWN_S = 10.0
 AGG_DEDUP_S = 1.0
 
-ROOT = Path(__file__).resolve().parents[1]
-SUMMARY_PATH = ROOT / "outputs" / "session_logs" / "last_summary.json"
-
 def _base_of(n: str) -> str:
     if n.endswith("_diff"): return n[:-5]
     if n.endswith("_ma5"): return n[:-4]
@@ -83,7 +80,7 @@ class OnlineFeatureBuilder:
 
 class OverlayProcessor(VideoProcessorBase):
     def __init__(self, engine, selected, speak=False, speak_gate=DEFAULT_SPEAK_GATE, show_debug=False,
-                 speak_fn=None, infer_seq_len=None, smooth_k=SMOOTH_K_DEFAULT):
+                 speak_fn=None, infer_seq_len=None, smooth_k=SMOOTH_K_DEFAULT, summary_path=None):
         self.engine = engine
         self.selected = selected
         self.show_debug = show_debug
@@ -128,6 +125,11 @@ class OverlayProcessor(VideoProcessorBase):
         computable = set(ANGLE_SPECS.keys()) | {"trunk_tilt"}
         self._uncomp_base = sorted(b for b in required_base if b not in computable)
         self._required_base = sorted(required_base)
+        if summary_path is None:
+            root = Path(__file__).resolve().parents[1]
+            self._summary_path = root / "outputs" / "session_logs" / "last_summary.json"
+        else:
+            self._summary_path = Path(summary_path)
 
     @property
     def tips_this_set(self):
@@ -162,8 +164,8 @@ class OverlayProcessor(VideoProcessorBase):
             self.last_summary_ts = ts
             self._last_summary_payload = {"text": summary, "ts": ts}
             try:
-                SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-                with open(SUMMARY_PATH, "w", encoding="utf-8") as f:
+                self._summary_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._summary_path, "w", encoding="utf-8") as f:
                     json.dump({"text": summary, "ts": ts}, f)
             except Exception as e:
                 LOGGER.warning(f"summary_persist_fail: {e}")
