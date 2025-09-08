@@ -118,6 +118,8 @@ class OverlayProcessor(VideoProcessorBase):
         self._start_ts = time.time()
         self._warmup_announced = False
         self._ready_announced = False
+        self._pose_seen_frames = 0
+        self._active_frames = 0
         self._feat_cols = self.engine["feat_cols"]
         self._mu = self.engine["mu"]
         self._sd = self.engine["sd"]
@@ -136,6 +138,8 @@ class OverlayProcessor(VideoProcessorBase):
         self.last_active_ts = time.time()
         self.last_pose_ts = time.time()
         self.idle_started_ts = None
+        self._pose_seen_frames = 0
+        self._active_frames = 0
         LOGGER.info("set | reset")
 
     def set_selected(self, s): self.selected = s
@@ -147,6 +151,9 @@ class OverlayProcessor(VideoProcessorBase):
 
     def speak_summary(self, k=2, min_count=2):
         summary = self._compose_summary(k=k, min_count=min_count)
+        if not summary:
+            lbl = (self.last_label or "exercise").replace("_","")
+            summary = f"Set complete. No corretive tips recorded. Good work on {lbl}"
         if summary:
             ts = time.time()
             self.last_summary_ts = ts
@@ -244,8 +251,10 @@ class OverlayProcessor(VideoProcessorBase):
             self.speak_fn("Start with a brief warm-up set. Coaching will begin shortly.")
         if self._mov_score >= ACTIVE_MOV_TH:
             self.last_active_ts = now
+            self._active_frames += 1
         if has_pose and (self._coverage >= 0.40):
             self.last_pose_ts = now
+            self._pose_seen_frames += 1
         if (self._mov_score < REST_MOV_TH) or (self._coverage < 0.30) or (not has_pose):
             if self.idle_started_ts is None:
                 self.idle_started_ts = now
@@ -370,5 +379,12 @@ class OverlayProcessor(VideoProcessorBase):
             nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
             if (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
                 self.speak_summary(k=3, min_count=2)
+        idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
+        nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
+        started = (self._pose_seen_frames >= 30) or (self._active_frames >= 15) or (self.agg.total > 0)
+        if started and (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
+            self.speak_summary(k=3, min_count=2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
