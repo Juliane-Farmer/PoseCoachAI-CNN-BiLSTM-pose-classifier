@@ -100,7 +100,6 @@ class OverlayProcessor(VideoProcessorBase):
         self._builder = None; self._neut_frac = 0.0
         self.status = "init"; self._coverage = 0.0; self._lower_cov = 0.0
         self._mov_score = 0.0
-        self._announced_ready = False
         self._last_tip = None; self._last_tip_t = 0.0
         self.coach = FormCoach()
         self._last_status = None
@@ -118,8 +117,9 @@ class OverlayProcessor(VideoProcessorBase):
         self._start_ts = time.time()
         self._warmup_announced = False
         self._ready_announced = False
-        self._pose_seen_frames = 0
-        self._active_frames = 0
+        self._ready_reached = False
+        self._summary_emitted = False
+        self._request_pause = False
         self._feat_cols = self.engine["feat_cols"]
         self._mu = self.engine["mu"]
         self._sd = self.engine["sd"]
@@ -138,8 +138,9 @@ class OverlayProcessor(VideoProcessorBase):
         self.last_active_ts = time.time()
         self.last_pose_ts = time.time()
         self.idle_started_ts = None
-        self._pose_seen_frames = 0
-        self._active_frames = 0
+        self._ready_reached = False
+        self._summary_emitted = False
+        self._request_pause = False
         LOGGER.info("set | reset")
 
     def set_selected(self, s): self.selected = s
@@ -150,10 +151,12 @@ class OverlayProcessor(VideoProcessorBase):
         return compose_humane_summary(self.agg.counts, self.agg.last_ts, k=k, min_count=min_count)
 
     def speak_summary(self, k=2, min_count=2):
+        if self._summary_emitted:
+            return None
         summary = self._compose_summary(k=k, min_count=min_count)
         if not summary:
-            lbl = (self.last_label or "exercise").replace("_","")
-            summary = f"Set complete. No corretive tips recorded. Good work on {lbl}"
+            lbl = (self.last_label or "exercise").replace("_", " ")
+            summary = f"Set complete. No corrective tips recorded. Good work on {lbl}. Keep consistent depth and tempo."
         if summary:
             ts = time.time()
             self.last_summary_ts = ts
@@ -169,7 +172,10 @@ class OverlayProcessor(VideoProcessorBase):
                     self.speak_fn(summary)
             except Exception:
                 pass
+            self._summary_emitted = True
+            self._request_pause = True
             self.agg.clear(); self._agg_last_time.clear()
+            self.idle_started_ts = None
             LOGGER.info(f"speak_summary | {summary}")
         return summary
 
@@ -211,6 +217,7 @@ class OverlayProcessor(VideoProcessorBase):
         all_joints = sorted(set(sum([list(v) for v in REQUIRED_JOINTS.values()], [])))
         self._coverage = (np.mean([(get_xyzv(lm, n)[1] >= VIS_THRESH) for n in all_joints]) if has_pose else 0.0)
         self._lower_cov = (np.mean([(get_xyzv(lm, n)[1] >= VIS_THRESH) for n in REQUIRED_JOINTS["squat"]]) if has_pose else 0.0)
+
         feats_raw = {}
         if has_pose:
             for base in self._required_base:
@@ -222,12 +229,13 @@ class OverlayProcessor(VideoProcessorBase):
                 pt, vis = get_xyzv(lm, NM)
                 nm = NM.lower()
                 feats_raw[f"{nm}_x"] = float(pt[0]) if vis >= VIS_THRESH else np.nan
-            for NM in ("LEFT_WRIST","RIGHT_WRIST"):
+            for NM in ("LEFT_WRIST","RIGHT_WRIST","LEFT_EAR","RIGHT_EAR","NOSE"):
                 pt, vis = get_xyzv(lm, NM)
                 nm = NM.lower()
                 feats_raw[f"{nm}_y"] = float(pt[1]) if vis >= VIS_THRESH else np.nan
         for b in self._required_base:
             feats_raw.setdefault(b, np.nan)
+
         if self._builder is None:
             self._builder = OnlineFeatureBuilder(self._required_base, ma_window=5)
         feats = self._builder.push(feats_raw)
@@ -251,22 +259,23 @@ class OverlayProcessor(VideoProcessorBase):
             self.speak_fn("Start with a brief warm-up set. Coaching will begin shortly.")
         if self._mov_score >= ACTIVE_MOV_TH:
             self.last_active_ts = now
-            self._active_frames += 1
         if has_pose and (self._coverage >= 0.40):
             self.last_pose_ts = now
-            self._pose_seen_frames += 1
         if (self._mov_score < REST_MOV_TH) or (self._coverage < 0.30) or (not has_pose):
             if self.idle_started_ts is None:
                 self.idle_started_ts = now
         else:
             self.idle_started_ts = None
+        ready_gate_ok = self.ready and enough_pose and (self._coverage >= 0.50)
         if not self.ready:
             if (WARMUP_PAD and len(self.feat_hist) >= self.prob_hist.maxlen) or (len(self.feat_hist) >= 12):
                 self.ready = True
                 LOGGER.info("engine | ready")
             else:
                 self.status = "need_full_body" if not enough_pose else "warming"
-        if self.speak and self.ready and (not self._ready_announced) and enough_pose and (self._coverage >= 0.50):
+        if ready_gate_ok:
+            self._ready_reached = True
+        if self.speak and ready_gate_ok and (not self._ready_announced):
             self._ready_announced = True
             self.speak_fn("PoseCoach is ready.")
 
@@ -297,6 +306,7 @@ class OverlayProcessor(VideoProcessorBase):
                 self.last_conf = float(avg_probs[sel_idx])
             else:
                 self.last_label = "unknown"; self.last_conf = 0.0
+
             self.status = "ok"
             tip = self.coach.update(self.last_label, self.last_raw, mov=self._mov_score, coverage=self._coverage)
 
@@ -335,15 +345,13 @@ class OverlayProcessor(VideoProcessorBase):
             self._last_tip = tip if self.last_label != "unknown" else None
             if self._last_tip and (self._coverage >= 0.5) and self._last_tip not in ("Keep going", f"{self.last_label} ready"):
                 self._record_tip_heard(self._last_tip)
+
             if self.speak:
-                if (not self._announced_ready) and (self.last_conf >= self.speak_gate) and (self._coverage >= 0.5):
-                    self._announced_ready = True
-                    self._last_tip_t = now
-                    self.speak_fn(f"{self.last_label} ready")
                 if self._last_tip and (now - self._last_tip_t > SPEAK_COOLDOWN) and (self._coverage >= 0.5):
                     self._speak_if_ok(self._last_tip)
                 elif (now - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 2) and (self._coverage >= 0.5) and (self._mov_score > 0.4):
                     self._speak_if_ok("Keep going", ignore_conf=True)
+
             fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
         else:
             self.prob_hist.clear()
@@ -374,17 +382,11 @@ class OverlayProcessor(VideoProcessorBase):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
         except Exception:
             pass
-        if self.agg.total > 0:
-            idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
-            nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
-            if (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
-                self.speak_summary(k=3, min_count=2)
+
         idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
         nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
-        started = (self._pose_seen_frames >= 30) or (self._active_frames >= 15) or (self.agg.total > 0)
-        if started and (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
+        started = self._ready_reached or (self.agg.total > 0)
+        if (not self._summary_emitted) and started and (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
             self.speak_summary(k=3, min_count=2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-
