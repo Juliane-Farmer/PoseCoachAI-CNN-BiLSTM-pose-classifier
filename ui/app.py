@@ -26,19 +26,27 @@ def _read_summary_file():
         pass
     return None
 
+def _summary_mtime_ns() -> int:
+    try:
+        return SUMMARY_PATH.stat().st_mtime_ns
+    except Exception:
+        return 0
+
 ss = st.session_state
 ss.setdefault("camera_paused", False)
 ss.setdefault("webrtc_nonce", 0)
 ss.setdefault("last_summary_text", "")
 ss.setdefault("last_summary_ts", 0.0)
+ss.setdefault("last_summary_mtime_ns", 0)
 
 if "init_done" not in ss:
     ss.init_done = True
-    _prev = _read_summary_file()
-    if _prev:
+    prev = _read_summary_file()
+    if prev:
         try:
-            ss.last_summary_ts = float(_prev.get("ts", 0.0))
-            ss.last_summary_text = str(_prev.get("text", "") or "")
+            ss.last_summary_ts = float(prev.get("ts", 0.0))
+            ss.last_summary_text = str(prev.get("text", "") or "")
+            ss.last_summary_mtime_ns = _summary_mtime_ns()
         except Exception:
             pass
 
@@ -60,7 +68,7 @@ tts = get_tts()
 try:
     from streamlit_autorefresh import st_autorefresh
     if not ss.camera_paused:
-        st_autorefresh(interval=2000, key=f"posecoach_tick_{ss.webrtc_nonce}")
+        st_autorefresh(interval=1500, key=f"posecoach_tick_{ss.webrtc_nonce}")
 except Exception:
     pass
 
@@ -73,20 +81,17 @@ with c2:
     speak_enabled = st.toggle("Voice tips", value=True)
 with c3:
     speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05)
+
 with st.sidebar:
     st.subheader("Debug & Utilities")
     if st.button("Speak test"):
         tts.say("This is a PoseCoach test.")
     beep_debug = st.toggle("Beep (debug)", value=False)
-    try:
-        tts.set_beep(beep_debug)
-    except Exception:
-        pass
+    try: tts.set_beep(beep_debug)
+    except Exception: pass
     if st.button("Beep test only"):
-        try:
-            tts.beep_once()
-        except Exception:
-            pass
+        try: tts.beep_once()
+        except Exception: pass
     show_debug = st.toggle("Debug overlays", value=False)
 
 st.markdown("### Session Controls")
@@ -111,6 +116,31 @@ with t3:
 RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]} )
 ctx = None
 
+def _pause_with_payload(vp, ctx_obj, payload=None, file_data=None):
+    if payload:
+        ss.last_summary_text = payload.get("text", "")
+        ss.last_summary_ts = float(payload.get("ts", time.time()))
+        ss.last_summary_mtime_ns = _summary_mtime_ns()
+    elif file_data:
+        ss.last_summary_text = str(file_data.get("text", "") or "")
+        ss.last_summary_ts = float(file_data.get("ts", time.time()))
+        ss.last_summary_mtime_ns = _summary_mtime_ns()
+    if vp is not None:
+        try:
+            vp._request_pause = False
+            vp.reset_set()
+        except Exception:
+            pass
+    tips_count_placeholder.metric("Tips this set", 0)
+    ss.camera_paused = True
+    ss.webrtc_nonce += 1
+    try:
+        if ctx_obj is not None:
+            ctx_obj.stop()
+    except Exception:
+        pass
+    rerun()
+
 if not ss.camera_paused:
     ctx = webrtc_streamer(
         key=f"posecoach_{ss.webrtc_nonce}",
@@ -123,6 +153,7 @@ if not ss.camera_paused:
             speak_gate=speak_gate,
             show_debug=show_debug,
             speak_fn=tts.say,
+            summary_path=SUMMARY_PATH,  # <<< shared explicit path
         ),
         rtc_configuration=RTC_CONFIGURATION,
         async_processing=True,
@@ -136,24 +167,10 @@ if not ss.camera_paused:
         vp.speak_fn = tts.say
         tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
 
-        # Hard handoff from processor when a summary is emitted
         if getattr(vp, "_request_pause", False):
             payload = vp.consume_summary_payload()
             file_data = _read_summary_file()
-            if payload:
-                ss.last_summary_text = payload.get("text", "")
-                ss.last_summary_ts = float(payload.get("ts", time.time()))
-            elif file_data:
-                ss.last_summary_text = str(file_data.get("text", "") or "")
-                ss.last_summary_ts = float(file_data.get("ts", time.time()))
-            vp._request_pause = False
-            vp.reset_set()
-            tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
-            ss.camera_paused = True
-            ss.webrtc_nonce += 1
-            try: ctx.stop()
-            except Exception: pass
-            rerun()
+            _pause_with_payload(vp, ctx, payload=payload, file_data=file_data)
 
         if end_clicked:
             if time.time() - ss.last_summary_ts < 5:
@@ -163,42 +180,20 @@ if not ss.camera_paused:
                 if summary:
                     ss.last_summary_text = summary
                     ss.last_summary_ts = time.time()
+                    ss.last_summary_mtime_ns = _summary_mtime_ns()
                     (st.toast if hasattr(st, "toast") else st.info)("Speaking set summary…")
-                    vp.reset_set()
-                    tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
-                    ss.camera_paused = True
-                    ss.webrtc_nonce += 1
-                    try: ctx.stop()
-                    except Exception: pass
-                    rerun()
+                    _pause_with_payload(vp, ctx)
                 else:
                     (st.toast if hasattr(st, "toast") else st.info)("No tips collected this set.")
 
         payload = vp.consume_summary_payload()
         if payload:
-            ss.last_summary_text = payload["text"]
-            ss.last_summary_ts = payload["ts"]
-            vp.reset_set()
-            tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
-            ss.camera_paused = True
-            ss.webrtc_nonce += 1
-            try: ctx.stop()
-            except Exception: pass
-            rerun()
+            _pause_with_payload(vp, ctx, payload=payload)
 
         file_data = _read_summary_file()
-        if file_data:
-            fts = float(file_data.get("ts", 0.0))
-            if fts != float(ss.last_summary_ts or 0.0):
-                ss.last_summary_text = str(file_data.get("text", "") or "")
-                ss.last_summary_ts = fts
-                vp.reset_set()
-                tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
-                ss.camera_paused = True
-                ss.webrtc_nonce += 1
-                try: ctx.stop()
-                except Exception: pass
-                rerun()
+        file_mtime_ns = _summary_mtime_ns()
+        if file_data and file_mtime_ns > (ss.last_summary_mtime_ns or 0):
+            _pause_with_payload(vp, ctx, file_data=file_data)
 
 else:
     st.info("Camera paused. Press START to begin the next set.")
