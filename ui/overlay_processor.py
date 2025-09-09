@@ -43,6 +43,11 @@ REST_MOV_TH = 0.12
 SUMMARY_COOLDOWN_S = 10.0
 AGG_DEDUP_S = 1.0
 
+READY_COV_TH = 0.42
+READY_CONSEC_FRAMES = 3
+READY_TIME_FALLBACK_S = 8.0
+START_CONF_TH = 0.30
+
 def _base_of(n: str) -> str:
     if n.endswith("_diff"): return n[:-5]
     if n.endswith("_ma5"): return n[:-4]
@@ -90,6 +95,7 @@ class OverlayProcessor(VideoProcessorBase):
         self.feat_hist = deque(maxlen=seq)
         self.ready = False
         self.pose_present = deque(maxlen=15)
+        self.recent_pose_ok = deque(maxlen=READY_CONSEC_FRAMES)
         self.last_label = "unknown"; self.last_conf = 0.0
         self.last_raw = {}; self.debug_top3 = ""
         self.speak = speak; self.speak_gate = speak_gate
@@ -117,6 +123,7 @@ class OverlayProcessor(VideoProcessorBase):
         self._ready_reached = False
         self._summary_emitted = False
         self._request_pause = False
+        self._set_started = False
         self._feat_cols = self.engine["feat_cols"]
         self._mu = self.engine["mu"]
         self._sd = self.engine["sd"]
@@ -143,6 +150,10 @@ class OverlayProcessor(VideoProcessorBase):
         self._ready_reached = False
         self._summary_emitted = False
         self._request_pause = False
+        self._set_started = False
+        self._ready_announced = False
+        self.pose_present.clear()
+        self.recent_pose_ok.clear()
         LOGGER.info("set | reset")
 
     def set_selected(self, s): self.selected = s
@@ -191,6 +202,9 @@ class OverlayProcessor(VideoProcessorBase):
         if (time.time() - last_t) >= AGG_DEDUP_S:
             self.agg.add(self.last_label, tip)
             self._agg_last_time[key] = time.time()
+            self._set_started = True
+            self.last_active_ts = time.time()
+            self.idle_started_ts = None
 
     def _speak_if_ok(self, tip, ignore_conf=False):
         reasons = []
@@ -268,18 +282,26 @@ class OverlayProcessor(VideoProcessorBase):
                 self.idle_started_ts = now
         else:
             self.idle_started_ts = None
-        ready_gate_ok = self.ready and enough_pose and (self._coverage >= 0.50)
+
+        self.recent_pose_ok.append(bool(has_pose and (self._coverage >= READY_COV_TH)))
+
         if not self.ready:
             if (WARMUP_PAD and len(self.feat_hist) >= self.prob_hist.maxlen) or (len(self.feat_hist) >= 12):
                 self.ready = True
                 LOGGER.info("engine | ready")
             else:
                 self.status = "need_full_body" if not enough_pose else "warming"
-        if ready_gate_ok:
+
+        ready_gate_ok = self.ready and (sum(self.recent_pose_ok) >= READY_CONSEC_FRAMES)
+        time_fallback_ok = self.ready and ((now - self._start_ts) >= READY_TIME_FALLBACK_S) and any(self.pose_present)
+
+        if ready_gate_ok or time_fallback_ok:
             self._ready_reached = True
-        if self.speak and ready_gate_ok and (not self._ready_announced):
+        if self.speak and (ready_gate_ok or time_fallback_ok) and (not self._ready_announced):
             self._ready_announced = True
             self.speak_fn("PoseCoach is ready.")
+            self.idle_started_ts = None
+            self.last_active_ts = now
 
         avg_probs = None
         if self.ready and enough_pose and quality_ok:
@@ -290,7 +312,7 @@ class OverlayProcessor(VideoProcessorBase):
                 mu_row = self._mu.astype(np.float32)
                 X_raw = np.vstack([np.tile(mu_row, (pad, 1)), X_tail])
             else:
-                X_raw = X_tail[-self.engine["seq_len"]:]
+                X_raw = X_tail[-(self.engine["seq_len"]):]
             X = (X_raw - self._mu) / self._sd
             xb = torch.from_numpy(X[None, ...].astype(np.float32)).to(self.engine["device"])
             with torch.no_grad():
@@ -345,8 +367,11 @@ class OverlayProcessor(VideoProcessorBase):
                     if min(la, ra) < 60: tip = "Raise arms higher"
 
             self._last_tip = tip if self.last_label != "unknown" else None
-            if self._last_tip and (self._coverage >= 0.5) and self._last_tip not in ("Keep going", f"{self.last_label} ready"):
-                self._record_tip_heard(self._last_tip)
+
+            if (not self._set_started) and (self._coverage >= 0.5) and (self.last_conf >= max(START_CONF_TH, self.speak_gate)) and (self._mov_score >= ACTIVE_MOV_TH):
+                self._set_started = True
+                self.idle_started_ts = None
+                self.last_active_ts = now
 
             if self.speak:
                 if self._last_tip and (now - self._last_tip_t > SPEAK_COOLDOWN) and (self._coverage >= 0.5):
@@ -378,16 +403,10 @@ class OverlayProcessor(VideoProcessorBase):
         if self.show_debug:
             cv2.putText(img, f"neutralized: {int(self._neut_frac*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2); y += 22
             cv2.putText(img, f"coverage: {int(self._coverage*100)}%  lower: {int(self._lower_cov*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2); y += 22
-        try:
-            h, w = img.shape[:2]
-            cv2.putText(img, f"tips: {self.agg.total}", (w - 160, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-        except Exception:
-            pass
 
         idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
         nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
-        started = self._ready_reached or (self.agg.total > 0)
+        started = self._set_started or (self.agg.total > 0)
         if (not self._summary_emitted) and started and (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
             self.speak_summary(k=3, min_count=2)
 
