@@ -1,3 +1,9 @@
+import os
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("absl_log_level", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import time
 import sys
 import json
@@ -51,8 +57,10 @@ if "init_done" not in ss:
             pass
 
 def rerun():
-    try: st.rerun()
-    except Exception: st.experimental_rerun()
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
 
 @st.cache_resource(show_spinner=False)
 def get_engine():
@@ -73,7 +81,6 @@ except Exception:
     pass
 
 st.title("PoseCoachAI — Real-time Coach")
-
 c1, c2, c3 = st.columns([2, 1, 1])
 with c1:
     selected_ex = st.selectbox("Select exercise", options=ENGINE["type_names"], index=0)
@@ -87,19 +94,20 @@ with st.sidebar:
     if st.button("Speak test"):
         tts.say("This is a PoseCoach test.")
     beep_debug = st.toggle("Beep (debug)", value=False)
-    try: tts.set_beep(beep_debug)
-    except Exception: pass
+    try:
+        tts.set_beep(beep_debug)
+    except Exception:
+        pass
     if st.button("Beep test only"):
-        try: tts.beep_once()
-        except Exception: pass
+        try:
+            tts.beep_once()
+        except Exception:
+            pass
     show_debug = st.toggle("Debug overlays", value=False)
-
 st.markdown("### Session Controls")
-t1, t2, t3 = st.columns([2, 2, 6])
+t1, t3 = st.columns([2, 8])
 with t1:
     end_clicked = st.button("End set ▶ Speak summary", type="primary", use_container_width=True)
-with t2:
-    tips_count_placeholder = st.empty()
 with t3:
     if ss.last_summary_text:
         ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(ss.last_summary_ts or time.time()))
@@ -108,12 +116,11 @@ with t3:
             data=ss.last_summary_text,
             file_name=f"posecoach_set_{ts}.txt",
             mime="text/plain",
-            use_container_width=True,
-        )
+            use_container_width=True, )
     else:
         st.button("Download last summary", disabled=True, use_container_width=True)
 
-RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]} )
+RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 ctx = None
 
 def _pause_with_payload(vp, ctx_obj, payload=None, file_data=None):
@@ -131,7 +138,6 @@ def _pause_with_payload(vp, ctx_obj, payload=None, file_data=None):
             vp.reset_set()
         except Exception:
             pass
-    tips_count_placeholder.metric("Tips this set", 0)
     ss.camera_paused = True
     ss.webrtc_nonce += 1
     try:
@@ -153,11 +159,9 @@ if not ss.camera_paused:
             speak_gate=speak_gate,
             show_debug=show_debug,
             speak_fn=tts.say,
-            summary_path=SUMMARY_PATH,  # <<< shared explicit path
-        ),
+            summary_path=SUMMARY_PATH, ),
         rtc_configuration=RTC_CONFIGURATION,
-        async_processing=True,
-    )
+        async_processing=True,)
 
     if ctx.video_processor is not None:
         vp = ctx.video_processor
@@ -165,7 +169,6 @@ if not ss.camera_paused:
         vp.set_speak(speak_enabled, gate=speak_gate)
         vp.set_debug(show_debug)
         vp.speak_fn = tts.say
-        tips_count_placeholder.metric("Tips this set", vp.tips_this_set)
 
         if getattr(vp, "_request_pause", False):
             payload = vp.consume_summary_payload()
