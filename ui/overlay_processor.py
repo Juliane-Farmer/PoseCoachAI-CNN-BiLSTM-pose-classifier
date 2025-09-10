@@ -124,10 +124,13 @@ class OverlayProcessor(VideoProcessorBase):
         self._summary_emitted = False
         self._request_pause = False
         self._set_started = False
+        
         self._feat_cols = self.engine["feat_cols"]
-        self._mu = self.engine["mu"]
-        self._sd = self.engine["sd"]
+        self._mu = self.engine["mu"].astype(np.float32, copy=False)
+        self._sd = self.engine["sd"].astype(np.float32, copy=False)
+        self._mu_row32 = self._mu
         self._mu_by_index = {i: float(self._mu[i]) for i,_ in enumerate(self._feat_cols)}
+
         required_base = { _base_of(n) for n in self._feat_cols } | {"trunk_tilt"}
         computable = set(ANGLE_SPECS.keys()) | {"trunk_tilt"}
         self._uncomp_base = sorted(b for b in required_base if b not in computable)
@@ -137,6 +140,13 @@ class OverlayProcessor(VideoProcessorBase):
             self._summary_path = root / "outputs" / "session_logs" / "last_summary.json"
         else:
             self._summary_path = Path(summary_path)
+        self._burn_in_frames = 3
+
+    def __del__(self):
+        try:
+            self.pose.close()
+        except Exception:
+            pass
 
     @property
     def tips_this_set(self):
@@ -154,6 +164,7 @@ class OverlayProcessor(VideoProcessorBase):
         self._ready_announced = False
         self.pose_present.clear()
         self.recent_pose_ok.clear()
+        self._burn_in_frames = 2
         LOGGER.info("set | reset")
 
     def set_selected(self, s): self.selected = s
@@ -213,7 +224,8 @@ class OverlayProcessor(VideoProcessorBase):
         if (not ignore_conf) and (self.last_conf < self.speak_gate): reasons.append(f"conf={self.last_conf:.2f}<gate={self.speak_gate:.2f}")
         if not tip: reasons.append("no-tip")
         if reasons:
-            LOGGER.info("speak_skip | " + ", ".join(reasons)); return
+            LOGGER.debug("speak_skip | " + ", ".join(reasons))
+            return
         self.speak_fn(tip)
         self._last_tip = tip
         self._last_tip_t = time.time()
@@ -226,11 +238,13 @@ class OverlayProcessor(VideoProcessorBase):
             self.frame_i += 1
             fps = None
             img = frame.to_ndarray(format="bgr24")
+            if self._burn_in_frames > 0:
+                self._burn_in_frames -= 1
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             res = self.pose.process(rgb)
             has_pose = bool(res.pose_landmarks); self.pose_present.append(has_pose)
             lm = res.pose_landmarks.landmark if has_pose else None
-
             all_joints = sorted(set(sum([list(v) for v in REQUIRED_JOINTS.values()], [])))
             self._coverage = (np.mean([(get_xyzv(lm, n)[1] >= VIS_THRESH) for n in all_joints]) if has_pose else 0.0)
             self._lower_cov = (np.mean([(get_xyzv(lm, n)[1] >= VIS_THRESH) for n in REQUIRED_JOINTS["squat"]]) if has_pose else 0.0)
@@ -245,7 +259,7 @@ class OverlayProcessor(VideoProcessorBase):
                     pt, vis = get_xyzv(lm, NM)
                     nm = NM.lower()
                     feats_raw[f"{nm}_x"] = float(pt[0]) if vis >= VIS_THRESH else np.nan
-                for NM in ("LEFT_WRIST","RIGHT_WRIST"):
+                for NM in ("LEFT_WRIST","RIGHT_WRIST","LEFT_EAR","RIGHT_EAR","NOSE"):
                     pt, vis = get_xyzv(lm, NM)
                     nm = NM.lower()
                     feats_raw[f"{nm}_y"] = float(pt[1]) if vis >= VIS_THRESH else np.nan
@@ -256,10 +270,8 @@ class OverlayProcessor(VideoProcessorBase):
                 self._builder = OnlineFeatureBuilder(self._required_base, ma_window=5)
             feats = self._builder.push(feats_raw)
             self.last_raw = feats_raw.copy()
-
             v, neut_frac = _vec_from_feats(feats, self._feat_cols, self._mu_by_index, set(self._uncomp_base))
             self._neut_frac = neut_frac; self.feat_hist.append(v)
-
             enough_pose = np.mean(list(self.pose_present)) >= 0.5
             quality_ok = (self._coverage >= QUALITY_COVERAGE_MIN) and (self._neut_frac <= QUALITY_NEUTRALIZE_MAX)
 
@@ -269,7 +281,6 @@ class OverlayProcessor(VideoProcessorBase):
             else:
                 self._mov_score = 0.0
             now = time.time()
-
             if (not self._warmup_announced) and self.speak and (now - self._start_ts) > 1.0:
                 self._warmup_announced = True
                 self.speak_fn("Start with a brief warm-up set. Coaching will begin shortly.")
@@ -284,13 +295,13 @@ class OverlayProcessor(VideoProcessorBase):
                 self.idle_started_ts = None
 
             self.recent_pose_ok.append(bool(has_pose and (self._coverage >= READY_COV_TH)))
+
             if not self.ready:
                 if (WARMUP_PAD and len(self.feat_hist) >= self.prob_hist.maxlen) or (len(self.feat_hist) >= 12):
                     self.ready = True
                     LOGGER.info("engine | ready")
                 else:
                     self.status = "need_full_body" if not enough_pose else "warming"
-
             ready_gate_ok = self.ready and (sum(self.recent_pose_ok) >= READY_CONSEC_FRAMES)
             time_fallback_ok = self.ready and ((now - self._start_ts) >= READY_TIME_FALLBACK_S) and any(self.pose_present)
 
@@ -303,18 +314,18 @@ class OverlayProcessor(VideoProcessorBase):
                 self.last_active_ts = now
 
             avg_probs = None
-            if self.ready and enough_pose and quality_ok:
+            if self.ready and quality_ok and (enough_pose or self._mov_score >= ACTIVE_MOV_TH):
                 tail_len = self.feat_hist.maxlen
                 X_tail = np.stack(list(self.feat_hist)[-tail_len:], axis=0)
                 pad = self.engine["seq_len"] - X_tail.shape[0]
                 if pad > 0:
-                    mu_row = self._mu.astype(np.float32)
-                    X_raw = np.vstack([np.tile(mu_row, (pad, 1)), X_tail])
+                    X_raw = np.vstack([np.tile(self._mu_row32, (pad, 1)), X_tail])
                 else:
                     X_raw = X_tail[-(self.engine["seq_len"]):]
                 X = (X_raw - self._mu) / self._sd
+                X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
                 xb = torch.from_numpy(X[None, ...].astype(np.float32)).to(self.engine["device"])
-                with torch.no_grad():
+                with torch.inference_mode():
                     logits_type, _ = self.engine["model"](xb)
                     probs = torch.softmax(logits_type, dim=1).cpu().numpy()[0]
 
@@ -363,8 +374,8 @@ class OverlayProcessor(VideoProcessorBase):
                         la = float(self.last_raw.get("left_shoulder_abd", 90) or 90)
                         ra = float(self.last_raw.get("right_shoulder_abd", 90) or 90)
                         if min(la, ra) < 60: tip = "Raise arms higher"
-
                 self._last_tip = tip if self.last_label != "unknown" else None
+
                 if (not self._set_started) and (self._coverage >= 0.5) and (self.last_conf >= max(START_CONF_TH, self.speak_gate)) and (self._mov_score >= ACTIVE_MOV_TH):
                     self._set_started = True
                     self.idle_started_ts = None
@@ -374,7 +385,6 @@ class OverlayProcessor(VideoProcessorBase):
                         self._speak_if_ok(self._last_tip)
                     elif (now - getattr(self, "_last_tip_t", 0.0)) > (SPEAK_COOLDOWN * 3.5) and (self._coverage >= 0.5) and (self._mov_score > 0.5):
                         self._speak_if_ok("Keep going", ignore_conf=True)
-
                 fps = 1.0 / max(1e-6, (time.time() - self._t_prev)); self._t_prev = time.time()
             else:
                 self.prob_hist.clear()
@@ -399,6 +409,13 @@ class OverlayProcessor(VideoProcessorBase):
             if self.show_debug:
                 cv2.putText(img, f"neutralized: {int(self._neut_frac*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2); y += 22
                 cv2.putText(img, f"coverage: {int(self._coverage*100)}%  lower: {int(self._lower_cov*100)}%", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 255, 180), 2); y += 22
+                if self.idle_started_ts is not None:
+                    idle_elapsed = now - self.idle_started_ts
+                    frac = max(0.0, min(1.0, idle_elapsed / REST_SECS))
+                    h, w = img.shape[:2]
+                    cv2.rectangle(img, (10, h - 18), (10 + int(frac * (w - 20)), h - 8), (0, 200, 255), -1)
+                    cv2.putText(img, f"idle {int(idle_elapsed)}s/{int(REST_SECS)}s", (10, h - 24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
             idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
             nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
@@ -416,5 +433,3 @@ class OverlayProcessor(VideoProcessorBase):
                 return av.VideoFrame.from_ndarray(fallback, format="bgr24")
             except Exception:
                 return frame
-
-
