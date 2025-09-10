@@ -7,6 +7,8 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 import time
 import sys
 import json
+import logging
+from datetime import datetime
 from pathlib import Path
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
@@ -21,7 +23,18 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-SUMMARY_PATH = Path(__file__).resolve().parents[1] / "outputs" / "session_logs" / "last_summary.json"
+LOG_DIR = ROOT / "outputs" / "session_logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / f"live_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+_root = logging.getLogger()
+if not _root.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()],
+    )
+
+SUMMARY_PATH = ROOT / "outputs" / "session_logs" / "last_summary.json"
 
 def _read_summary_file():
     try:
@@ -81,6 +94,7 @@ except Exception:
     pass
 
 st.title("PoseCoachAI — Real-time Coach")
+
 c1, c2, c3 = st.columns([2, 1, 1])
 with c1:
     selected_ex = st.selectbox("Select exercise", options=ENGINE["type_names"], index=0)
@@ -104,6 +118,7 @@ with st.sidebar:
         except Exception:
             pass
     show_debug = st.toggle("Debug overlays", value=False)
+
 st.markdown("### Session Controls")
 t1, t3 = st.columns([2, 8])
 with t1:
@@ -116,9 +131,18 @@ with t3:
             data=ss.last_summary_text,
             file_name=f"posecoach_set_{ts}.txt",
             mime="text/plain",
-            use_container_width=True, )
+            use_container_width=True,
+        )
     else:
         st.button("Download last summary", disabled=True, use_container_width=True)
+
+    if st.button("Clear last summary"):
+        ss.last_summary_text = ""
+        ss.last_summary_ts = 0.0
+        try:
+            SUMMARY_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 ctx = None
@@ -159,9 +183,11 @@ if not ss.camera_paused:
             speak_gate=speak_gate,
             show_debug=show_debug,
             speak_fn=tts.say,
-            summary_path=SUMMARY_PATH, ),
+            summary_path=SUMMARY_PATH,
+        ),
         rtc_configuration=RTC_CONFIGURATION,
-        async_processing=True,)
+        async_processing=True,
+    )
 
     if ctx.video_processor is not None:
         vp = ctx.video_processor
