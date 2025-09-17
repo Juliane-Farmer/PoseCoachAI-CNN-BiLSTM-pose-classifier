@@ -1,22 +1,22 @@
 import threading, queue, time, logging, sys
 
 try:
-    import pythoncom  
+    import pythoncom
 except Exception:
     pythoncom = None
 
 try:
-    import win32com.client as win32client 
+    import win32com.client as win32client
 except Exception:
     win32client = None
 
 try:
-    import pyttsx3 
+    import pyttsx3
 except Exception:
     pyttsx3 = None
 
 try:
-    import winsound  
+    import winsound
 except Exception:
     winsound = None
 
@@ -26,13 +26,10 @@ if not LOG.handlers:
     h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", "%H:%M:%S"))
     LOG.addHandler(h)
 LOG.setLevel(logging.INFO)
-
+LOG.propagate = False
 
 class TTS:
-    """Windows-safe TTS queue.Prefers native SAPI (COM) in a dedicated STA worker thread.Falls back to pyttsx3 if needed. """
-
-    def __init__(self, prefer_browser: bool = False,rate: int = 175,volume: float = 1.0, voice: str | None = None,beep: bool = True, backend: str = "auto", ):
-
+    def __init__(self, prefer_browser: bool = False,rate: int = 175,volume: float = 1.0, voice: str | None = None,beep: bool = True, backend: str = "auto"):
         self._q: queue.Queue[str | None] = queue.Queue()
         self._alive = True
         self._cfg = {"rate": int(rate), "volume": float(volume), "voice": voice}
@@ -54,11 +51,17 @@ class TTS:
             except Exception:
                 pass
 
+    def flush(self):
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+
     def _map_wpm_to_sapi_rate(self, wpm: int) -> int:
         return max(-10, min(10, int(round((wpm - 175) / 25))))
 
     def _setup_sapi(self):
-        """Create native SAPI voice in this (worker) thread."""
         if pythoncom is None or win32client is None:
             raise RuntimeError("SAPI COM not available")
         pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
@@ -84,7 +87,7 @@ class TTS:
             voice.Volume = max(0, min(100, int(self._cfg["volume"] * 100)))
         except Exception:
             pass
-        return voice  
+        return voice
 
     def _setup_pyttsx3(self):
         if pyttsx3 is None:
@@ -161,20 +164,15 @@ class TTS:
             LOG.info("TTS worker stopped")
 
     def say(self, text: str):
-        """Flush queued-but-not-started items and enqueue `text` next."""
         if not text:
             return
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
+        self.flush()
         self._q.put(text)
 
-    def controls(self): 
+    def controls(self):
         return None
 
-    def render(self): 
+    def render(self):
         return None
 
     def close(self):
@@ -187,6 +185,4 @@ class TTS:
             self._worker.join(timeout=1.0)
         except Exception:
             pass
-
-
 
