@@ -31,10 +31,10 @@ if not _root.handlers:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-7s | %(message)s",
-        handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()],
-    )
+        handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()],)
 
 SUMMARY_PATH = ROOT / "outputs" / "session_logs" / "last_summary.json"
+PAUSE_FLAG_PATH = ROOT / "outputs" / "session_logs" / "pause.flag"
 
 def _read_summary_file():
     try:
@@ -51,12 +51,19 @@ def _summary_mtime_ns() -> int:
     except Exception:
         return 0
 
+def _pause_flag_mtime_ns() -> int:
+    try:
+        return PAUSE_FLAG_PATH.stat().st_mtime_ns
+    except Exception:
+        return 0
+
 ss = st.session_state
 ss.setdefault("camera_paused", False)
 ss.setdefault("webrtc_nonce", 0)
 ss.setdefault("last_summary_text", "")
 ss.setdefault("last_summary_ts", 0.0)
 ss.setdefault("last_summary_mtime_ns", 0)
+ss.setdefault("last_pause_flag_ns", _pause_flag_mtime_ns())
 
 if "init_done" not in ss:
     ss.init_done = True
@@ -89,7 +96,7 @@ tts = get_tts()
 try:
     from streamlit_autorefresh import st_autorefresh
     if not ss.camera_paused:
-        st_autorefresh(interval=1500, key=f"posecoach_tick_{ss.webrtc_nonce}")
+        st_autorefresh(interval=500, key=f"posecoach_tick_{ss.webrtc_nonce}")
 except Exception:
     pass
 
@@ -131,11 +138,9 @@ with t3:
             data=ss.last_summary_text,
             file_name=f"posecoach_set_{ts}.txt",
             mime="text/plain",
-            use_container_width=True,
-        )
+            use_container_width=True, )
     else:
         st.button("Download last summary", disabled=True, use_container_width=True)
-
     if st.button("Clear last summary"):
         ss.last_summary_text = ""
         ss.last_summary_ts = 0.0
@@ -156,7 +161,15 @@ def _pause_with_payload(vp, ctx_obj, payload=None, file_data=None):
         ss.last_summary_text = str(file_data.get("text", "") or "")
         ss.last_summary_ts = float(file_data.get("ts", time.time()))
         ss.last_summary_mtime_ns = _summary_mtime_ns()
+    try:
+        tts.flush()
+    except Exception:
+        pass
     if vp is not None:
+        try:
+            vp.suppress_ready(True)
+        except Exception:
+            pass
         try:
             vp._request_pause = False
             vp.reset_set()
@@ -168,7 +181,7 @@ def _pause_with_payload(vp, ctx_obj, payload=None, file_data=None):
         if ctx_obj is not None:
             ctx_obj.stop()
     except Exception:
-        pass
+        ss.camera_paused = True
     rerun()
 
 if not ss.camera_paused:
@@ -184,10 +197,9 @@ if not ss.camera_paused:
             show_debug=show_debug,
             speak_fn=tts.say,
             summary_path=SUMMARY_PATH,
-        ),
+            pause_flag_path=PAUSE_FLAG_PATH,),
         rtc_configuration=RTC_CONFIGURATION,
-        async_processing=True,
-    )
+        async_processing=True, )
 
     if ctx.video_processor is not None:
         vp = ctx.video_processor
@@ -195,35 +207,35 @@ if not ss.camera_paused:
         vp.set_speak(speak_enabled, gate=speak_gate)
         vp.set_debug(show_debug)
         vp.speak_fn = tts.say
-
         if getattr(vp, "_request_pause", False):
             payload = vp.consume_summary_payload()
             file_data = _read_summary_file()
             _pause_with_payload(vp, ctx, payload=payload, file_data=file_data)
-
         if end_clicked:
-            if time.time() - ss.last_summary_ts < 5:
-                (st.toast if hasattr(st, "toast") else st.info)("Summary just delivered.")
+            try:
+                vp.suppress_ready(True)
+            except Exception:
+                pass
+            summary = vp.speak_summary(k=3, min_count=2)
+            if summary:
+                ss.last_summary_text = summary
+                ss.last_summary_ts = time.time()
+                ss.last_summary_mtime_ns = _summary_mtime_ns()
+                _pause_with_payload(vp, ctx)
             else:
-                summary = vp.speak_summary(k=3, min_count=2)
-                if summary:
-                    ss.last_summary_text = summary
-                    ss.last_summary_ts = time.time()
-                    ss.last_summary_mtime_ns = _summary_mtime_ns()
-                    (st.toast if hasattr(st, "toast") else st.info)("Speaking set summary…")
-                    _pause_with_payload(vp, ctx)
-                else:
-                    (st.toast if hasattr(st, "toast") else st.info)("No tips collected this set.")
+                st.info("No tips collected this set.")
 
         payload = vp.consume_summary_payload()
         if payload:
             _pause_with_payload(vp, ctx, payload=payload)
-
         file_data = _read_summary_file()
         file_mtime_ns = _summary_mtime_ns()
         if file_data and file_mtime_ns > (ss.last_summary_mtime_ns or 0):
             _pause_with_payload(vp, ctx, file_data=file_data)
-
+        pf_mtime = _pause_flag_mtime_ns()
+        if pf_mtime > (ss.last_pause_flag_ns or 0):
+            ss.last_pause_flag_ns = pf_mtime
+            _pause_with_payload(vp, ctx)
 else:
     st.info("Camera paused. Press START to begin the next set.")
     if st.button("START camera", type="primary", use_container_width=True):
@@ -232,3 +244,5 @@ else:
         rerun()
 
 tts.render()
+
+
