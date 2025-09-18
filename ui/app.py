@@ -12,6 +12,13 @@ from datetime import datetime
 from pathlib import Path
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import streamlit.components.v1 as components
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _HAS_AUTO = True
+except Exception:
+    _HAS_AUTO = False
 
 from posecoach.inference.engine import load_engine
 from overlay_processor import OverlayProcessor, DEFAULT_SPEAK_GATE
@@ -64,6 +71,7 @@ ss.setdefault("last_summary_text", "")
 ss.setdefault("last_summary_ts", 0.0)
 ss.setdefault("last_summary_mtime_ns", 0)
 ss.setdefault("last_pause_flag_ns", _pause_flag_mtime_ns())
+ss.setdefault("aggressive_stop", False)
 
 if "init_done" not in ss:
     ss.init_done = True
@@ -93,12 +101,19 @@ def get_tts(cache_buster: int = 1):
 ENGINE = get_engine()
 tts = get_tts()
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-    if not ss.camera_paused:
+if not ss.camera_paused:
+    if _HAS_AUTO:
         st_autorefresh(interval=500, key=f"posecoach_tick_{ss.webrtc_nonce}")
-except Exception:
-    pass
+    else:
+        components.html(
+            """
+            <script>
+              setTimeout(function(){
+                try { window.parent.postMessage({type: 'streamlit:rerun'}, '*'); } catch(e) {}
+              }, 500);
+            </script>
+            """,
+            height=0, )
 
 st.title("PoseCoachAI — Real-time Coach")
 
@@ -125,6 +140,7 @@ with st.sidebar:
         except Exception:
             pass
     show_debug = st.toggle("Debug overlays", value=False)
+    ss.aggressive_stop = st.toggle("Stop camera after summary (aggressive)", value=False)
 
 st.markdown("### Session Controls")
 t1, t3 = st.columns([2, 8])
@@ -133,12 +149,7 @@ with t1:
 with t3:
     if ss.last_summary_text:
         ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(ss.last_summary_ts or time.time()))
-        st.download_button(
-            "Download last summary",
-            data=ss.last_summary_text,
-            file_name=f"posecoach_set_{ts}.txt",
-            mime="text/plain",
-            use_container_width=True, )
+        st.download_button("Download last summary",data=ss.last_summary_text, file_name=f"posecoach_set_{ts}.txt", mime="text/plain", use_container_width=True, )
     else:
         st.button("Download last summary", disabled=True, use_container_width=True)
     if st.button("Clear last summary"):
@@ -177,6 +188,22 @@ def _pause_with_payload(vp, ctx_obj, payload=None, file_data=None):
             pass
     ss.camera_paused = True
     ss.webrtc_nonce += 1
+    if ss.aggressive_stop:
+        components.html(
+            """
+            <script>
+            (function(){
+              try{
+                const vids = Array.from(document.querySelectorAll('video'));
+                vids.forEach(v=>{
+                  const s = v.srcObject;
+                  if(s){ (s.getTracks()||[]).forEach(t=>{ try{t.stop()}catch(e){} }); }
+                });
+              }catch(e){}
+            })();
+            </script>
+            """,
+            height=0 )
     try:
         if ctx_obj is not None:
             ctx_obj.stop()
@@ -197,9 +224,9 @@ if not ss.camera_paused:
             show_debug=show_debug,
             speak_fn=tts.say,
             summary_path=SUMMARY_PATH,
-            pause_flag_path=PAUSE_FLAG_PATH,),
+            pause_flag_path=PAUSE_FLAG_PATH, ),
         rtc_configuration=RTC_CONFIGURATION,
-        async_processing=True, )
+        async_processing=True,)
 
     if ctx.video_processor is not None:
         vp = ctx.video_processor
@@ -224,14 +251,15 @@ if not ss.camera_paused:
                 _pause_with_payload(vp, ctx)
             else:
                 st.info("No tips collected this set.")
-
         payload = vp.consume_summary_payload()
         if payload:
             _pause_with_payload(vp, ctx, payload=payload)
+
         file_data = _read_summary_file()
         file_mtime_ns = _summary_mtime_ns()
         if file_data and file_mtime_ns > (ss.last_summary_mtime_ns or 0):
             _pause_with_payload(vp, ctx, file_data=file_data)
+
         pf_mtime = _pause_flag_mtime_ns()
         if pf_mtime > (ss.last_pause_flag_ns or 0):
             ss.last_pause_flag_ns = pf_mtime
@@ -244,5 +272,3 @@ else:
         rerun()
 
 tts.render()
-
-
