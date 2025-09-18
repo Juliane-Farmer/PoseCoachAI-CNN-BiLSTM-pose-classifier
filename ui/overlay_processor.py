@@ -145,6 +145,8 @@ class OverlayProcessor(VideoProcessorBase):
         else:
             self._pause_flag_path = Path(pause_flag_path)
         self._burn_in_frames = 3
+        self._countdown_deadline = None
+        self._countdown_secs = 6.0
 
     def __del__(self):
         try:
@@ -208,6 +210,8 @@ class OverlayProcessor(VideoProcessorBase):
             lbl = (self.last_label or "exercise").replace("_", " ")
             summary = f"Set complete. No corrective tips recorded. Good work on {lbl}. Keep consistent depth and tempo."
         if summary:
+            summary = summary + " Keep moving to start another set, or press STOP to end the session."
+        if summary:
             ts = time.time()
             self.last_summary_ts = ts
             self._last_summary_payload = {"text": summary, "ts": ts}
@@ -227,6 +231,7 @@ class OverlayProcessor(VideoProcessorBase):
             self._suppress_ready = True
             self.speak = False
             self._emit_pause_flag()
+            self._countdown_deadline = time.time() + self._countdown_secs
             self.agg.clear(); self._agg_last_time.clear()
             self.idle_started_ts = None
             LOGGER.info(f"speak_summary | {summary}")
@@ -438,15 +443,29 @@ class OverlayProcessor(VideoProcessorBase):
                 cv2.putText(img, "mov", (12, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
                 cv2.rectangle(img, (10, h - 18), (10 + rg_bar, h - 8), (220, 180, 80), -1)
                 cv2.putText(img, f"ready {rg}/{READY_CONSEC_FRAMES}", (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-                if self.idle_started_ts is not None:
-                    idle_elapsed = now - self.idle_started_ts
-                    frac = max(0.0, min(1.0, idle_elapsed / REST_SECS))
-                    cv2.rectangle(img, (10, h - 78), (10 + int(frac * (w - 20)), h - 68), (0, 200, 255), -1)
+                if self._summary_emitted:
+                    remain = max(0.0, (self._countdown_deadline or now) - now)
+                    overlay = img.copy()
+                    cv2.rectangle(overlay, (0, 0), (w, 60), (0, 0, 0), -1)
+                    alpha = 0.55
+                    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+                    msg = f"Set complete. Auto-stop in {int(round(remain))}s. Move to start another set or press STOP."
+                    cv2.putText(img, msg, (14, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
             idle_ok = (self.idle_started_ts is not None) and ((now - self.idle_started_ts) >= REST_SECS)
             nopose_ok = (now - self.last_pose_ts) >= NOPOSE_REST_SECS
             started = self._set_started or (self.agg.total > 0)
             if (not self._summary_emitted) and started and (idle_ok or nopose_ok) and ((now - self.last_summary_ts) >= SUMMARY_COOLDOWN_S):
                 self.speak_summary(k=3, min_count=2)
+            if self._summary_emitted:
+                if (self._coverage >= 0.5 and self._mov_score >= ACTIVE_MOV_TH):
+                    self._summary_emitted = False
+                    self._request_pause = False
+                    self._suppress_ready = False
+                    self.speak = True
+                    self._countdown_deadline = None
+                elif self._countdown_deadline and (now >= self._countdown_deadline):
+                    self._emit_pause_flag()
+                    self._request_pause = True
             return av.VideoFrame.from_ndarray(img, format="bgr24")
         except Exception as e:
             LOGGER.exception(f"recv_error: {e}")
