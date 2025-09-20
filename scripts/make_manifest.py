@@ -1,55 +1,35 @@
 import os
-import cv2
+from pathlib import Path
 import pandas as pd
 
-VID_DIR = "dataset/videos"
-OUT_CSV = "dataset/video_labels.csv"
+ROOT = Path(__file__).resolve().parents[1]
+ANGLES_CSV = ROOT / "dataset" / "video_angles.csv"
+OUT_CSV = ROOT / "dataset" / "video_labels.csv"
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
 
-def infer_exercise(name: str):
-    n = name.lower()
-    if "jump" in n:
+def norm_video_name(name: str) -> str:
+    return str(name).replace("\u00A0", " ").strip().lower()
+
+def infer_label_from_name(name: str) -> str:
+    s = name.lower()
+    if "jack" in s:
         return "Jumping Jacks"
-    if "pull" in n:
+    if "pull" in s and "up" in s:
         return "Pull ups"
-    if "push" in n:
+    if "push" in s and "up" in s:
         return "Push Ups"
-    if "squat" in n:
-        return "Squats"
-    if "russian" in n or "twist" in n:
+    if "twist" in s:
         return "Russian twists"
-    return None
+    if "squat" in s:
+        return "Squats"
+    return "Unknown"
 
-def get_frame_count(path: str) -> int:
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        return 999999 
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
-    return total if total > 0 else 999999
+def main():
+    df = pd.read_csv(ANGLES_CSV, encoding="utf-8")
+    df["video_norm"] = df["video_norm"].astype(str).apply(norm_video_name)
+    vids = df[["video_norm"]].drop_duplicates().reset_index(drop=True)
+    vids["label"] = vids["video_norm"].apply(infer_label_from_name)
+    vids.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
 
-rows = []
-for f in os.listdir(VID_DIR):
-    if not f.lower().endswith((".mp4", ".avi", ".mov")):
-        continue
-    if "&" in f:
-        print(f"[skip] mixed exercise file: {f}")
-        continue
-    label = infer_exercise(f)
-    if not label:
-        print(f"[warn] unknown exercise for {f}, skipping.")
-        continue
-    full = os.path.join(VID_DIR, f)
-    end_frame = get_frame_count(full) - 1
-    rows.append({
-        "video": f,
-        "start_frame": 0,
-        "end_frame": end_frame if end_frame > 0 else 999999,
-        "exercise_type": label,
-        "form_label": "good"   
-    })
-
-df = pd.DataFrame(rows)
-df.to_csv(OUT_CSV, index=False)
-print(f"Wrote {OUT_CSV} with {len(df)} rows")
-
-
+if __name__ == "__main__":
+    main()
