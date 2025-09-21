@@ -1,109 +1,137 @@
 import os
-import numpy as np
+from pathlib import Path
+import math
 import pandas as pd
+import numpy as np
 
-IN_CSV  = os.path.join('dataset', 'video_keypoints.csv')
-OUT_CSV = os.path.join('dataset', 'video_angles.csv')
+ROOT = Path(__file__).resolve().parents[1]
+KP_DIR = ROOT / "dataset" / "keypoints"
+OUT_CSV = ROOT / "dataset" / "video_angles.csv"
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+
 VIS_THRESH = 0.5
 
-def compute_angle(a, b, c):
-    """
-    Angle at point b formed by segments (b->a) and (b->c), in degrees.
-    Returns NaN if any vector is degenerate.
-    """
+IDX = {
+    "NOSE": 0,
+    "LEFT_EAR": 7,
+    "RIGHT_EAR": 8,
+    "LEFT_SHOULDER": 11,
+    "RIGHT_SHOULDER": 12,
+    "LEFT_ELBOW": 13,
+    "RIGHT_ELBOW": 14,
+    "LEFT_WRIST": 15,
+    "RIGHT_WRIST": 16,
+    "LEFT_HIP": 23,
+    "RIGHT_HIP": 24,
+    "LEFT_KNEE": 25,
+    "RIGHT_KNEE": 26,
+    "LEFT_ANKLE": 27,
+    "RIGHT_ANKLE": 28,}
+
+def norm_video_name(name: str) -> str:
+    return str(name).replace("\u00A0", " ").strip().lower()
+
+def angle_at(b, a, c):
     ba = a - b
     bc = c - b
     nba = np.linalg.norm(ba)
     nbc = np.linalg.norm(bc)
     if nba == 0 or nbc == 0:
         return np.nan
-    cosang = np.dot(ba, bc) / (nba * nbc)
-    return np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0)))
+    cosang = np.clip(np.dot(ba, bc) / (nba * nbc), -1.0, 1.0)
+    return math.degrees(math.acos(cosang))
 
-def get_xyzv(row, name):
-    """Return (xyz, vis) for landmark NAME_* columns, or (None, vis) if missing."""
-    try:
-        x = row[f'{name}_x']; y = row[f'{name}_y']; z = row[f'{name}_z']; v = row[f'{name}_v']
-        return np.array([x, y, z], dtype=np.float32), float(v)
-    except KeyError:
-        return None, 0.0
-
-def safe_joint_angle(row, A, B, C):
-    """
-    Compute angle A–B–C if all three landmarks exist and have sufficient visibility.
-    """
-    a, va = get_xyzv(row, A)
-    b, vb = get_xyzv(row, B)
-    c, vc = get_xyzv(row, C)
-    if a is None or b is None or c is None:
+def trunk_tilt_deg(shoulder, hip):
+    v = shoulder - hip
+    if np.linalg.norm(v) == 0:
         return np.nan
-    if (va < VIS_THRESH) or (vb < VIS_THRESH) or (vc < VIS_THRESH):
-        return np.nan
-    return compute_angle(a, b, c)
+    up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+    cosang = np.clip(np.dot(v / np.linalg.norm(v), up), -1.0, 1.0)
+    ang = math.degrees(math.acos(cosang))
+    return float(ang)
 
-def trunk_tilt_deg(row):
-    """
-    Angle between torso (mid-hip -> mid-shoulder) and the image vertical (0, -1, 0).
-    0° ≈ upright; larger = leaning. Uses absolute angle.
-    """
-    ls, vs = get_xyzv(row, 'LEFT_SHOULDER')
-    rs, vsr = get_xyzv(row, 'RIGHT_SHOULDER')
-    lh, vh = get_xyzv(row, 'LEFT_HIP')
-    rh, vhr = get_xyzv(row, 'RIGHT_HIP')
-    if any(v is None for v in [ls, rs, lh, rh]):
-        return np.nan
-    if min(vs, vsr, vh, vhr) < VIS_THRESH:
-        return np.nan
-    mid_sh = (ls + rs) / 2.0
-    mid_hip = (lh + rh) / 2.0
-    torso = mid_sh - mid_hip
-    n = np.linalg.norm(torso)
-    if n == 0:
-        return np.nan
-    torso = torso / n
-    vertical = np.array([0.0, -1.0, 0.0], dtype=np.float32)  # up in image coords
-    cosang = float(np.clip(np.dot(torso, vertical), -1.0, 1.0))
-    return np.degrees(np.arccos(cosang))
+def has_vis(row, i):
+    return float(row.get(f"v{i}", 0.0)) >= VIS_THRESH
 
-df = pd.read_csv(IN_CSV)
+def xyz(row, i):
+    return np.array([float(row.get(f"x{i}", 0.0)), float(row.get(f"y{i}", 0.0)), float(row.get(f"z{i}", 0.0))], dtype=np.float32)
 
-angles = {
-    'right_elbow_angle': ('RIGHT_SHOULDER', 'RIGHT_ELBOW', 'RIGHT_WRIST'),
-    'left_elbow_angle' : ('LEFT_SHOULDER',  'LEFT_ELBOW',  'LEFT_WRIST'),
+def compute_features(df):
+    out = []
+    for _, r in df.iterrows():
+        feats = {"frame": int(r["frame"])}
+        if all(has_vis(r, IDX[k]) for k in ["RIGHT_SHOULDER","RIGHT_ELBOW","RIGHT_WRIST"]):
+            feats["right_elbow_angle"] = angle_at(xyz(r, IDX["RIGHT_ELBOW"]), xyz(r, IDX["RIGHT_SHOULDER"]), xyz(r, IDX["RIGHT_WRIST"]))
+        else:
+            feats["right_elbow_angle"] = np.nan
+        if all(has_vis(r, IDX[k]) for k in ["LEFT_SHOULDER","LEFT_ELBOW","LEFT_WRIST"]):
+            feats["left_elbow_angle"] = angle_at(xyz(r, IDX["LEFT_ELBOW"]), xyz(r, IDX["LEFT_SHOULDER"]), xyz(r, IDX["LEFT_WRIST"]))
+        else:
+            feats["left_elbow_angle"] = np.nan
+        if all(has_vis(r, IDX[k]) for k in ["RIGHT_HIP","RIGHT_KNEE","RIGHT_ANKLE"]):
+            feats["right_knee_angle"] = angle_at(xyz(r, IDX["RIGHT_KNEE"]), xyz(r, IDX["RIGHT_HIP"]), xyz(r, IDX["RIGHT_ANKLE"]))
+        else:
+            feats["right_knee_angle"] = np.nan
+        if all(has_vis(r, IDX[k]) for k in ["LEFT_HIP","LEFT_KNEE","LEFT_ANKLE"]):
+            feats["left_knee_angle"] = angle_at(xyz(r, IDX["LEFT_KNEE"]), xyz(r, IDX["LEFT_HIP"]), xyz(r, IDX["LEFT_ANKLE"]))
+        else:
+            feats["left_knee_angle"] = np.nan
+        if all(has_vis(r, IDX[k]) for k in ["RIGHT_SHOULDER","RIGHT_HIP","RIGHT_KNEE"]):
+            feats["right_hip_angle"] = angle_at(xyz(r, IDX["RIGHT_HIP"]), xyz(r, IDX["RIGHT_SHOULDER"]), xyz(r, IDX["RIGHT_KNEE"]))
+        else:
+            feats["right_hip_angle"] = np.nan
+        if all(has_vis(r, IDX[k]) for k in ["LEFT_SHOULDER","LEFT_HIP","LEFT_KNEE"]):
+            feats["left_hip_angle"] = angle_at(xyz(r, IDX["LEFT_HIP"]), xyz(r, IDX["LEFT_SHOULDER"]), xyz(r, IDX["LEFT_KNEE"]))
+        else:
+            feats["left_hip_angle"] = np.nan
+        if all(has_vis(r, IDX[k]) for k in ["LEFT_SHOULDER","LEFT_HIP"]):
+            feats["trunk_tilt"] = trunk_tilt_deg(xyz(r, IDX["LEFT_SHOULDER"]), xyz(r, IDX["LEFT_HIP"]))
+        elif all(has_vis(r, IDX[k]) for k in ["RIGHT_SHOULDER","RIGHT_HIP"]):
+            feats["trunk_tilt"] = trunk_tilt_deg(xyz(r, IDX["RIGHT_SHOULDER"]), xyz(r, IDX["RIGHT_HIP"]))
+        else:
+            feats["trunk_tilt"] = np.nan
+        if all(has_vis(r, IDX[k]) for k in ["LEFT_ELBOW","LEFT_SHOULDER","LEFT_HIP"]):
+            feats["left_shoulder_abd"] = angle_at(xyz(r, IDX["LEFT_SHOULDER"]), xyz(r, IDX["LEFT_ELBOW"]), xyz(r, IDX["LEFT_HIP"]))
+        else:
+            feats["left_shoulder_abd"] = np.nan
+        if all(has_vis(r, IDX[k]) for k in ["RIGHT_ELBOW","RIGHT_SHOULDER","RIGHT_HIP"]):
+            feats["right_shoulder_abd"] = angle_at(xyz(r, IDX["RIGHT_SHOULDER"]), xyz(r, IDX["RIGHT_ELBOW"]), xyz(r, IDX["RIGHT_HIP"]))
+        else:
+            feats["right_shoulder_abd"] = np.nan
+        out.append(feats)
+    return pd.DataFrame(out)
 
-    'right_knee_angle' : ('RIGHT_HIP', 'RIGHT_KNEE', 'RIGHT_ANKLE'),
-    'left_knee_angle'  : ('LEFT_HIP',  'LEFT_KNEE',  'LEFT_ANKLE'),
+def add_temporal_features(df):
+    df = df.sort_values("frame").reset_index(drop=True)
+    base_cols = [c for c in df.columns if c not in ("frame","video","video_norm")]
+    for c in base_cols:
+        df[f"{c}_diff"] = df[c].diff()
+        df[f"{c}_ma5"] = df[c].rolling(5, min_periods=1).mean()
+    return df
 
-    'right_hip_angle'  : ('RIGHT_SHOULDER', 'RIGHT_HIP', 'RIGHT_KNEE'),
-    'left_hip_angle'   : ('LEFT_SHOULDER',  'LEFT_HIP',  'LEFT_KNEE'),
+def load_keypoints_csv(p):
+    df = pd.read_csv(p, encoding="utf-8")
+    if "frame" not in df.columns:
+        df["frame"] = np.arange(len(df), dtype=int)
+    return df
 
-    'right_shoulder_abd': ('RIGHT_HIP', 'RIGHT_SHOULDER', 'RIGHT_ELBOW'),
-    'left_shoulder_abd' : ('LEFT_HIP',  'LEFT_SHOULDER',  'LEFT_ELBOW'),}
+def main():
+    rows = []
+    for csvf in sorted(KP_DIR.glob("*.csv")):
+        stem = csvf.stem
+        vid = stem + ".mp4"
+        df = load_keypoints_csv(csvf)
+        feat = compute_features(df)
+        feat["video"] = vid
+        feat["video_norm"] = norm_video_name(vid)
+        rows.append(feat)
+    if not rows:
+        return
+    angles = pd.concat(rows, axis=0, ignore_index=True)
+    angles = angles.groupby("video_norm", group_keys=False).apply(add_temporal_features)
+    angles.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
 
-for out_col, (A, B, C) in angles.items():
-    df[out_col] = [safe_joint_angle(row, A, B, C) for _, row in df.iterrows()]
-
-df['trunk_tilt'] = [trunk_tilt_deg(row) for _, row in df.iterrows()]
-
-angle_cols = list(angles.keys()) + ['trunk_tilt']
-
-def add_temporal_features(g):
-    for c in angle_cols:
-        g[f'{c}_diff'] = g[c].diff()
-        g[f'{c}_ma5']  = g[c].rolling(window=5, min_periods=1).mean()
-    g[angle_cols] = g[angle_cols].interpolate(limit_direction='both')
-    return g
-
-if 'video' in df.columns:
-    df = df.sort_values(['video', 'frame']).groupby('video', group_keys=False).apply(add_temporal_features)
-else:
-    df = df.sort_values('frame')
-    df = add_temporal_features(df)
-
-df.to_csv(OUT_CSV, index=False)
-
-print(f"Wrote joint angles (+ temporal features) to {OUT_CSV}")
-print(f"Angle features added: {', '.join(angle_cols)}")
-print("Temporal features: *_diff, *_ma5")
+if __name__ == "__main__":
+    main()
 
 

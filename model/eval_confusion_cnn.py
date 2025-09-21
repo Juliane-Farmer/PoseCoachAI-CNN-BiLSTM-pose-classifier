@@ -2,9 +2,7 @@ import os, argparse, glob, numpy as np, pandas as pd, torch
 from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 
-from train_coach_cnn import (
-    CNNBiLSTM, load_npz, seed_everything,
-    make_grouped_stratified_by_video, make_grouped_split_all_classes)
+from train_coach_cnn import (CNNBiLSTM, load_npz, seed_everything,make_grouped_stratified_by_video, make_grouped_split_all_classes,)
 
 def resolve_model_path(model_path):
     if model_path and model_path.lower() != "auto":
@@ -35,9 +33,22 @@ def get_split(X, y_type, videos, grouped=True, strategy="stratified", val_ratio=
         (tr, va), = StratifiedShuffleSplit(n_splits=1, test_size=val_ratio, random_state=seed).split(X, y_type)
     return tr, va
 
+def resolve_summary_csv(data_npz, summary_csv_cli):
+    if summary_csv_cli and os.path.exists(summary_csv_cli):
+        return summary_csv_cli
+    base = os.path.splitext(data_npz)[0]
+    candidates = [
+        f"{base}_summary.csv",
+        os.path.join(os.path.dirname(data_npz), "windows_phase2_norm_summary.csv"),
+        os.path.join(os.path.dirname(data_npz), "windows_phase2_summary.csv"),]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    raise FileNotFoundError(f"Missing summary CSV. Tried: {', '.join(candidates)}")
+
 def main():
     ap = argparse.ArgumentParser(description="Evaluate Phase-2 model: confusion matrix + report")
-    ap.add_argument("--model_path", default="auto", help="'auto' = newest .pt in model/")
+    ap.add_argument("--model_path", default="auto")
     ap.add_argument("--data_npz", default="dataset/windows_phase2_norm.npz")
     ap.add_argument("--summary_csv", default=None)
     ap.add_argument("--grouped_split", type=int, default=1)
@@ -51,7 +62,6 @@ def main():
     ap.add_argument("--out_prefix", default=None)
     args = ap.parse_args()
     seed_everything(args.seed)
-
     model_path = resolve_model_path(args.model_path)
     out_prefix = default_out_prefix(args.out_prefix, model_path)
     os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
@@ -60,39 +70,40 @@ def main():
 
     X, y_type, y_form, feat_cols, type_names, _ = load_npz(args.data_npz)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    summary_csv = args.summary_csv or os.path.splitext(args.data_npz)[0] + "_summary.csv"
-    if not os.path.exists(summary_csv):
-        alt = os.path.join(os.path.dirname(args.data_npz), "windows_phase2_summary.csv")
-        if os.path.exists(alt): summary_csv = alt
-        else: raise FileNotFoundError(f"Missing summary CSV: tried {summary_csv} and {alt}")
-    meta = pd.read_csv(summary_csv)
-    assert len(meta) == len(X), "summary rows must match number of windows"
-    videos = meta["video"].values
 
+    summary_csv = resolve_summary_csv(args.data_npz, args.summary_csv)
+    meta = pd.read_csv(summary_csv)
+
+    if len(meta) != len(X):
+        n = min(len(meta), len(X))
+        print(f"[warn] summary rows ({len(meta)}) != windows ({len(X)}); trimming both to {n}.")
+        meta = meta.iloc[:n].reset_index(drop=True)
+        X = X[:n]
+        y_type = y_type[:n]
+        if y_form is not None:
+            y_form = y_form[:n]
+    videos = meta["video"].values
     train_idx, val_idx = get_split(
         X, y_type, videos,
         grouped=bool(args.grouped_split),
         strategy=args.grouped_strategy,
         val_ratio=args.val_ratio,
-        seed=args.seed)
+        seed=args.seed,)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_type = int(y_type.max()+1)
     model = CNNBiLSTM(
         in_feats=X.shape[2], cnn_channels=args.cnn_channels,
         lstm_hidden=args.lstm_hidden, lstm_layers=args.lstm_layers,
-        dropout=args.dropout, num_type=n_type, num_form=None ).to(device)
+        dropout=args.dropout, num_type=n_type, num_form=None).to(device)
     state = torch.load(model_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
-
     xb = torch.tensor(X[val_idx], dtype=torch.float32).to(device)
     with torch.no_grad():
         logits, _ = model(torch.nan_to_num(xb, nan=0.0, posinf=0.0, neginf=0.0))
         preds = logits.argmax(1).cpu().numpy()
     y_true = y_type[val_idx]
-
-    from sklearn.metrics import confusion_matrix, classification_report
     cm = confusion_matrix(y_true, preds, labels=np.arange(n_type))
     rep = classification_report(y_true, preds, target_names=type_names if type_names else None, zero_division=0)
     row_labels = [f"true_{t}" for t in (type_names or range(n_type))]
@@ -101,7 +112,6 @@ def main():
     with open(f"{out_prefix}_report.txt", "w", encoding="utf-8") as f:
         f.write(rep)
 
-    import matplotlib.pyplot as plt
     plt.figure(figsize=(6,5))
     plt.imshow(cm, interpolation="nearest")
     plt.title("Confusion matrix")
@@ -121,8 +131,5 @@ def main():
     plt.savefig(f"{out_prefix}_cm.png", dpi=160)
     print("Saved:", f"{out_prefix}_cm.csv", f"{out_prefix}_report.txt", f"{out_prefix}_cm.png")
 
-
 if __name__ == "__main__":
     main()
-
-
