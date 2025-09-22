@@ -113,17 +113,16 @@ if not ss.camera_paused:
               }, 500);
             </script>
             """,
-            height=0, )
+            height=0,)
 
 st.title("PoseCoachAI — Real-time Coach")
+st.info("PoseCoachAI works best when you wear tight or fitted clothing. Avoid loose garments that hide joints.")
 
-c1, c2, c3 = st.columns([2, 1, 1])
+c1, c2 = st.columns([2, 1])
 with c1:
     selected_ex = st.selectbox("Select exercise", options=ENGINE["type_names"], index=0)
 with c2:
     speak_enabled = st.toggle("Voice tips", value=True)
-with c3:
-    speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05)
 
 with st.sidebar:
     st.subheader("Debug & Utilities")
@@ -141,24 +140,12 @@ with st.sidebar:
             pass
     show_debug = st.toggle("Debug overlays", value=False)
     ss.aggressive_stop = st.toggle("Stop camera after summary (aggressive)", value=False)
+    speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05)
 
 st.markdown("### Session Controls")
-t1, t3 = st.columns([2, 8])
+t1 = st.columns([2])[0]
 with t1:
     end_clicked = st.button("End set ▶ Speak summary", type="primary", use_container_width=True)
-with t3:
-    if ss.last_summary_text:
-        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(ss.last_summary_ts or time.time()))
-        st.download_button("Download last summary",data=ss.last_summary_text, file_name=f"posecoach_set_{ts}.txt", mime="text/plain", use_container_width=True, )
-    else:
-        st.button("Download last summary", disabled=True, use_container_width=True)
-    if st.button("Clear last summary"):
-        ss.last_summary_text = ""
-        ss.last_summary_ts = 0.0
-        try:
-            SUMMARY_PATH.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 ctx = None
@@ -203,13 +190,36 @@ def _pause_with_payload(vp, ctx_obj, payload=None, file_data=None):
             })();
             </script>
             """,
-            height=0 )
+            height=0)
     try:
         if ctx_obj is not None:
             ctx_obj.stop()
     except Exception:
         ss.camera_paused = True
     rerun()
+
+def render_summary_section():
+    st.markdown("### Summary")
+    b1, b2 = st.columns(2)
+    with b1:
+        if ss.last_summary_text:
+            ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(ss.last_summary_ts or time.time()))
+            st.download_button(
+                "Download last summary",
+                data=ss.last_summary_text,
+                file_name=f"posecoach_set_{ts}.txt",
+                mime="text/plain",
+                use_container_width=True,)
+        else:
+            st.button("Download last summary", disabled=True, use_container_width=True)
+    with b2:
+        if st.button("Clear last summary", use_container_width=True):
+            ss.last_summary_text = ""
+            ss.last_summary_ts = 0.0
+            try:
+                SUMMARY_PATH.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 if not ss.camera_paused:
     ctx = webrtc_streamer(
@@ -226,7 +236,7 @@ if not ss.camera_paused:
             summary_path=SUMMARY_PATH,
             pause_flag_path=PAUSE_FLAG_PATH, ),
         rtc_configuration=RTC_CONFIGURATION,
-        async_processing=True,)
+        async_processing=True)
 
     if ctx.video_processor is not None:
         vp = ctx.video_processor
@@ -254,21 +264,21 @@ if not ss.camera_paused:
         payload = vp.consume_summary_payload()
         if payload:
             _pause_with_payload(vp, ctx, payload=payload)
-
         file_data = _read_summary_file()
         file_mtime_ns = _summary_mtime_ns()
         if file_data and file_mtime_ns > (ss.last_summary_mtime_ns or 0):
             _pause_with_payload(vp, ctx, file_data=file_data)
-
         pf_mtime = _pause_flag_mtime_ns()
         if pf_mtime > (ss.last_pause_flag_ns or 0):
             ss.last_pause_flag_ns = pf_mtime
             _pause_with_payload(vp, ctx)
+    render_summary_section()
 else:
     st.info("Camera paused. Press START to begin the next set.")
     if st.button("START camera", type="primary", use_container_width=True):
         ss.camera_paused = False
         ss.webrtc_nonce += 1
         rerun()
+    render_summary_section()
 
 tts.render()
