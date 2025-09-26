@@ -12,14 +12,17 @@ build/
 dist/
 .eggs/
 dataset/exercise_detection/*.csv
-dataset/videos/*.mp4 
+dataset/videos/*.mp4
+dataset/keypoints/* 
 dataset/*.csv
 dataset/*.npz
 dataset/windows_*.npz
+!dataset/.gitkeep
 
 model/*.txt
 model/**/*.pt
 model/**/scaler*.pkl
+model/**/*lstm.py
 
 artifacts/**
 
