@@ -4,7 +4,7 @@ import torch
 
 def load_engine(root: Path):
     npz_path = root / "dataset" / "windows_phase2_norm.npz"
-    model_path = root / "model" / "phase2_cnn_bilstm_v9.pt"
+    model_path = root / "model" / "phase2_cnn_bilstm_v10.pt"
     if not npz_path.exists():
         raise FileNotFoundError(f"Missing dataset npz: {npz_path}")
     if not model_path.exists():
