@@ -23,6 +23,7 @@ model/*.txt
 model/**/*.pt
 model/**/scaler*.pkl
 model/**/*lstm.py
+!model/phase2_cnn_bilstm_v10.pt
 
 artifacts/**
 
