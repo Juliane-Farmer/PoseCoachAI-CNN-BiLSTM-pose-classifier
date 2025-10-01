@@ -43,6 +43,10 @@ if not _root.handlers:
 SUMMARY_PATH = ROOT / "outputs" / "session_logs" / "last_summary.json"
 PAUSE_FLAG_PATH = ROOT / "outputs" / "session_logs" / "pause.flag"
 
+DEBUG_UI_DISABLED = True           
+FIXED_CONF_SCORE = 10             
+FIXED_SPEAK_GATE = DEFAULT_SPEAK_GATE  
+
 def _read_summary_file():
     try:
         if SUMMARY_PATH.exists():
@@ -113,7 +117,7 @@ if not ss.camera_paused:
               }, 500);
             </script>
             """,
-            height=0,)
+            height=0, )
 
 st.title("PoseCoachAI — Real-time Coach")
 st.info("PoseCoachAI works best when you wear tight or fitted clothing. Avoid loose garments that hide joints.")
@@ -124,23 +128,13 @@ with c1:
 with c2:
     speak_enabled = st.toggle("Voice tips", value=True)
 
-with st.sidebar:
-    st.subheader("Debug & Utilities")
-    if st.button("Speak test"):
-        tts.say("This is a PoseCoach test.")
-    beep_debug = st.toggle("Beep (debug)", value=False)
-    try:
-        tts.set_beep(beep_debug)
-    except Exception:
-        pass
-    if st.button("Beep test only"):
-        try:
-            tts.beep_once()
-        except Exception:
-            pass
-    show_debug = st.toggle("Debug overlays", value=False)
-    ss.aggressive_stop = st.toggle("Stop camera after summary (aggressive)", value=False)
-    speak_gate = st.slider("Speak ≥", 0.0, 1.0, DEFAULT_SPEAK_GATE, 0.05)
+show_debug = False
+ss.aggressive_stop = False
+speak_gate = FIXED_SPEAK_GATE
+try:
+    tts.set_beep(False)
+except Exception:
+    pass
 
 st.markdown("### Session Controls")
 t1 = st.columns([2])[0]
@@ -209,7 +203,7 @@ def render_summary_section():
                 data=ss.last_summary_text,
                 file_name=f"posecoach_set_{ts}.txt",
                 mime="text/plain",
-                use_container_width=True,)
+                use_container_width=True, )
         else:
             st.button("Download last summary", disabled=True, use_container_width=True)
     with b2:
@@ -231,23 +225,36 @@ if not ss.camera_paused:
             selected=selected_ex,
             speak=speak_enabled,
             speak_gate=speak_gate,
-            show_debug=show_debug,
+            show_debug=False,  
             speak_fn=tts.say,
             summary_path=SUMMARY_PATH,
-            pause_flag_path=PAUSE_FLAG_PATH, ),
+            pause_flag_path=PAUSE_FLAG_PATH,),
         rtc_configuration=RTC_CONFIGURATION,
         async_processing=True)
 
     if ctx.video_processor is not None:
         vp = ctx.video_processor
+        try:
+            if hasattr(vp, "set_conf_score"):
+                vp.set_conf_score(FIXED_CONF_SCORE)
+            elif hasattr(vp, "conf_score"):
+                vp.conf_score = FIXED_CONF_SCORE
+        except Exception:
+            pass
+
         vp.set_selected(selected_ex)
         vp.set_speak(speak_enabled, gate=speak_gate)
-        vp.set_debug(show_debug)
+        try:
+            vp.set_debug(False)
+        except Exception:
+            pass
         vp.speak_fn = tts.say
+
         if getattr(vp, "_request_pause", False):
             payload = vp.consume_summary_payload()
             file_data = _read_summary_file()
             _pause_with_payload(vp, ctx, payload=payload, file_data=file_data)
+
         if end_clicked:
             try:
                 vp.suppress_ready(True)
@@ -261,17 +268,21 @@ if not ss.camera_paused:
                 _pause_with_payload(vp, ctx)
             else:
                 st.info("No tips collected this set.")
+
         payload = vp.consume_summary_payload()
         if payload:
             _pause_with_payload(vp, ctx, payload=payload)
+
         file_data = _read_summary_file()
         file_mtime_ns = _summary_mtime_ns()
         if file_data and file_mtime_ns > (ss.last_summary_mtime_ns or 0):
             _pause_with_payload(vp, ctx, file_data=file_data)
+
         pf_mtime = _pause_flag_mtime_ns()
         if pf_mtime > (ss.last_pause_flag_ns or 0):
             ss.last_pause_flag_ns = pf_mtime
             _pause_with_payload(vp, ctx)
+
     render_summary_section()
 else:
     st.info("Camera paused. Press START to begin the next set.")
